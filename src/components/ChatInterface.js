@@ -14,7 +14,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { useChat } from "../contexts/ChatContext";
 import { parseReport, streamCarAnalysis } from "../utils/claudeApi";
-import { submitRodinJob, waitForRodinModel } from "../utils/hyper3d";
+import { submitRodinJob, submitRodinJobFromVehicle, waitForRodinModel } from "../utils/hyper3d";
 import {
   extractTextFromPDF,
   fileToBase64,
@@ -516,12 +516,14 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 
 	// Start Hyper3D model generation in background after analysis completes
 	const startRodinJob = useCallback(
-		async (imageBase64, imageMediaType, prompt) => {
+		async (imageBase64, imageMediaType, prompt, vehicleFallback = null) => {
 			rodinAbort.current?.abort();
 			const controller = new AbortController();
 			rodinAbort.current = controller;
 			try {
-				const job = await submitRodinJob(imageBase64, imageMediaType, prompt);
+				const job = imageBase64
+					? await submitRodinJob(imageBase64, imageMediaType, prompt)
+					: await submitRodinJobFromVehicle(vehicleFallback);
 				if (!job || controller.signal.aborted) return;
 				setActiveReport((prev) =>
 					prev ? { ...prev, modelStatus: "Pending" } : prev,
@@ -731,11 +733,11 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 						imageBase64,
 						imageMediaType,
 					);
-					// Kick off Hyper3D 3D model generation in background
-					if (imageBase64) {
-						const prompt = `${vLabel} exterior, realistic car`;
-						startRodinJob(imageBase64, imageMediaType, prompt);
-					}
+					// Kick off Hyper3D 3D model generation in background.
+					// If the user attached a photo, use it. Otherwise fall back to
+					// text-to-3D using the decoded vehicle data (VIN path).
+					const prompt = `${vLabel} exterior, realistic car`;
+					startRodinJob(imageBase64, imageMediaType, prompt, report.vehicle);
 				}
 			} catch (err) {
 				failStep(steps.length - 1, `Failed: ${err.message}`);

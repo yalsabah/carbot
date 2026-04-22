@@ -23,7 +23,7 @@ module.exports = function (app) {
   app.use(
     '/api/rodin',
     createProxyMiddleware({
-      target: 'https://hyperhuman.deemos.com',
+      target: 'https://api.hyper3d.com',
       changeOrigin: true,
       pathRewrite: { '^/api/rodin': '/api/v2/rodin' },
       onProxyReq: (proxyReq) => {

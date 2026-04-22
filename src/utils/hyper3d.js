@@ -1,18 +1,34 @@
 const RODIN_KEY = process.env.REACT_APP_HYPER3D_API_KEY;
 
-// Submit an image to Hyper3D Rodin for 3D model generation.
+// Build a rich text prompt from a vehicle report object (VIN fallback path).
+function buildVehiclePrompt(vehicle) {
+  const parts = [
+    vehicle?.year, vehicle?.make, vehicle?.model, vehicle?.trim,
+  ].filter(Boolean);
+  const base = parts.join(' ') || 'car';
+  return `${base} exterior, front three-quarter view, studio automotive photography, high detail`;
+}
+
+// Submit an image (or text prompt only) to Hyper3D Rodin Gen-2 for 3D model generation.
+// imageBase64 / imageMediaType are optional — omit both for text-to-3D from vehicle data.
 // Returns { taskUuid, jobUuid } or null if key not configured.
 export async function submitRodinJob(imageBase64, imageMediaType, prompt) {
   if (!RODIN_KEY) return null;
 
-  const blob = await (await fetch(`data:${imageMediaType};base64,${imageBase64}`)).blob();
   const form = new FormData();
-  form.append('images', blob, 'vehicle.jpg');
-  form.append('prompt', prompt || 'car vehicle exterior');
+
+  if (imageBase64 && imageMediaType) {
+    const blob = await (await fetch(`data:${imageMediaType};base64,${imageBase64}`)).blob();
+    form.append('images', blob, 'vehicle.jpg');
+  }
+
+  form.append('prompt', prompt || 'car vehicle exterior, high detail');
+  form.append('tier', 'Gen-2');
+  form.append('mesh_mode', 'Quad');
+  form.append('quality', 'High');
+  form.append('addons', 'HighPack');
   form.append('geometry_file_format', 'glb');
   form.append('material', 'PBR');
-  form.append('quality', 'medium');
-  form.append('use_hyper', 'false');
 
   const res = await fetch('/api/rodin/', {
     method: 'POST',
@@ -27,7 +43,13 @@ export async function submitRodinJob(imageBase64, imageMediaType, prompt) {
   return { taskUuid, jobUuid };
 }
 
-// Poll job status. Returns { status, glbUrl } where status is 'Pending'|'Running'|'Done'|'Failed'.
+// Submit using only vehicle report data (no photo available).
+export async function submitRodinJobFromVehicle(vehicle) {
+  return submitRodinJob(null, null, buildVehiclePrompt(vehicle));
+}
+
+// Poll job status. Returns { status, glbUrl }.
+// status is one of: 'Pending' | 'Running' | 'Done' | 'Failed'
 export async function pollRodinJob(taskUuid, jobUuid) {
   if (!RODIN_KEY) return { status: 'Failed' };
 
@@ -45,8 +67,8 @@ export async function pollRodinJob(taskUuid, jobUuid) {
 
 // Full polling loop. Calls onProgress(status) and resolves with glbUrl or null.
 export async function waitForRodinModel(taskUuid, jobUuid, onProgress, signal) {
-  const INTERVAL = 8000; // poll every 8s
-  const TIMEOUT = 10 * 60 * 1000; // 10 min max
+  const INTERVAL = 10000; // Gen-2 / HighPack jobs take longer — poll every 10s
+  const TIMEOUT  = 15 * 60 * 1000; // 15 min max
   const start = Date.now();
 
   while (Date.now() - start < TIMEOUT) {
