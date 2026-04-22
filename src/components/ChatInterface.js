@@ -666,22 +666,23 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 						}
 						fullText += chunk;
 						charCount += chunk.length;
-						if (charCount % 200 < chunk.length) {
-							steps = steps.map((s, i) =>
-								i === steps.length - 1
-									? {
-											...s,
-											text: `Generating deal analysis… (${charCount} chars)`,
-										}
+						const _ft = fullText;
+						const _cc = charCount;
+						if (_cc % 200 < chunk.length) {
+							const _prevSteps = steps;
+							steps = _prevSteps.map((s, i) =>
+								i === _prevSteps.length - 1
+									? { ...s, text: `Generating deal analysis… (${_cc} chars)` }
 									: s,
 							);
+							const _steps = steps;
 							updateLastMessage((prev) => ({
 								...prev,
-								text: fullText,
-								steps: [...steps],
+								text: _ft,
+								steps: [..._steps],
 							}));
 						} else {
-							updateLastMessage((prev) => ({ ...prev, text: fullText }));
+							updateLastMessage((prev) => ({ ...prev, text: _ft }));
 						}
 					}
 				}
@@ -813,7 +814,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 				for await (const chunk of stream) {
 					if (typeof chunk === "string") {
 						fullText += chunk;
-						updateLastMessage((prev) => ({ ...prev, text: fullText }));
+						const _ft = fullText;
+						updateLastMessage((prev) => ({ ...prev, text: _ft }));
 					}
 				}
 				const report = parseReport(fullText);
@@ -886,7 +888,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 				for await (const chunk of stream) {
 					if (typeof chunk === "string") {
 						fullText += chunk;
-						updateLastMessage((prev) => ({ ...prev, text: fullText }));
+						const _ft = fullText;
+						updateLastMessage((prev) => ({ ...prev, text: _ft }));
 					}
 				}
 				const report = parseReport(fullText);
