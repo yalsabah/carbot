@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import {
   collection, addDoc, updateDoc, doc, serverTimestamp, getDocs, deleteDoc
 } from 'firebase/firestore';
@@ -14,27 +14,11 @@ export function ChatProvider({ children }) {
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
+  const autoResumedRef = useRef(false);
 
-  const loadSessions = useCallback(async () => {
-    if (!user) return;
-    setLoadingSessions(true);
-    try {
-      // Use simple collection read (no orderBy) to avoid requiring a Firestore composite index.
-      // Sort by updatedAt/createdAt client-side instead.
-      const snap = await getDocs(collection(db, 'users', user.uid, 'sessions'));
-      const sorted = snap.docs
-        .map(d => ({ id: d.id, ...d.data() }))
-        .sort((a, b) => {
-          const ta = a.updatedAt?.toMillis?.() ?? a.createdAt?.toMillis?.() ?? 0;
-          const tb = b.updatedAt?.toMillis?.() ?? b.createdAt?.toMillis?.() ?? 0;
-          return tb - ta;
-        });
-      setSessions(sorted);
-    } catch {
-      // Firestore offline — silently skip
-    } finally {
-      setLoadingSessions(false);
-    }
+  // Reset auto-resume on sign-out/user switch so a subsequent sign-in resumes correctly.
+  useEffect(() => {
+    if (!user) autoResumedRef.current = false;
   }, [user]);
 
   const createSession = useCallback(async (title = 'New Assessment') => {
@@ -81,6 +65,33 @@ export function ChatProvider({ children }) {
       setMessages([]);
     }
   }, [user]);
+
+  const loadSessions = useCallback(async () => {
+    if (!user) return;
+    setLoadingSessions(true);
+    try {
+      const snap = await getDocs(collection(db, 'users', user.uid, 'sessions'));
+      const sorted = snap.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => {
+          const ta = a.updatedAt?.toMillis?.() ?? a.createdAt?.toMillis?.() ?? 0;
+          const tb = b.updatedAt?.toMillis?.() ?? b.createdAt?.toMillis?.() ?? 0;
+          return tb - ta;
+        });
+      setSessions(sorted);
+
+      // On first load after sign-in / page refresh, resume the most recent session
+      // so the user lands where they left off instead of a blank new chat.
+      if (!autoResumedRef.current && sorted.length > 0) {
+        autoResumedRef.current = true;
+        await loadSession(sorted[0].id);
+      }
+    } catch (err) {
+      console.error('loadSessions: Firestore read failed', err);
+    } finally {
+      setLoadingSessions(false);
+    }
+  }, [user, loadSession]);
 
   // Firestore rejects `undefined` values — strip large/ephemeral fields and any undefined entries.
   // Drops: isStreaming (transient), steps (transient UI), _img64/_imgMt (too large for Firestore 1MB doc limit).

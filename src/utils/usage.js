@@ -86,7 +86,7 @@ export async function incrementUserUsage(userId, userEmail) {
 }
 
 export const PLANS = [
-  { id: 'free', name: 'Free', price: '$0', prompts: '3/day', description: 'Try CarBot for free' },
+  { id: 'free', name: 'Free', price: '$0', prompts: '3/day', description: 'Try VinCritiq for free' },
   { id: 'starter', name: 'Starter', price: '$5.99/mo', prompts: '50 prompts', description: 'Perfect for occasional buyers' },
   { id: 'pro', name: 'Pro', price: '$11.99/mo', prompts: '150 prompts', description: 'Serious car shoppers' },
   { id: 'unlimited', name: 'Unlimited', price: '$29.99/mo', prompts: 'Unlimited', description: 'Dealers & power users' },

@@ -39,7 +39,7 @@ export default function Sidebar({ onOpenSettings, onOpenAuth, collapsed, onToggl
           <Car size={16} className="text-white" />
         </div>
         {!collapsed && (
-          <span className="font-bold text-base" style={{ color: 'var(--color-text)' }}>CarBot</span>
+          <span className="font-bold text-base" style={{ color: 'var(--color-text)' }}>VinCritiq</span>
         )}
       </div>
 

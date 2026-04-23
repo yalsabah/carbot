@@ -204,7 +204,7 @@ export default function SettingsModal({ onClose }) {
                     </pre>
                   </div>
                 ) : (
-                  <p className="text-sm" style={{ color: 'var(--color-muted)' }}>No preferences stored yet. CarBot learns your preferences as you analyze vehicles.</p>
+                  <p className="text-sm" style={{ color: 'var(--color-muted)' }}>No preferences stored yet. VinCritiq learns your preferences as you analyze vehicles.</p>
                 )}
                 <button
                   onClick={clearMemory}

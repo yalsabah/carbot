@@ -16,7 +16,7 @@ export default function UpgradeModal({ onClose, onSignIn }) {
           </div>
           <h2 className="font-bold text-lg mb-1" style={{ color: 'var(--color-text)' }}>You've reached your limit</h2>
           <p className="text-sm" style={{ color: 'var(--color-muted)' }}>
-            Upgrade to continue analyzing vehicle deals with CarBot.
+            Upgrade to continue analyzing vehicle deals with VinCritiq.
           </p>
         </div>
 

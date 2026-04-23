@@ -1,7 +1,7 @@
 const CLAUDE_API_KEY = process.env.REACT_APP_CLAUDE_API_KEY;
 const MODEL = 'claude-sonnet-4-20250514';
 
-const SYSTEM_PROMPT = (userMemory = '') => `You are CarBot, an expert AI vehicle deal analyst. You help users evaluate car deals by analyzing CARFAX reports, vehicle images, pricing data, and financing terms.
+const SYSTEM_PROMPT = (userMemory = '') => `You are VinCritiq, an expert AI vehicle deal analyst. You help users evaluate car deals by analyzing CARFAX reports, vehicle images, pricing data, and financing terms.
 
 ${userMemory ? `User history & preferences:\n${userMemory}\n` : ''}
 

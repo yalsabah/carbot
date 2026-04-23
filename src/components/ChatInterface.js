@@ -787,6 +787,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			addMessage,
 			persistLastMessage,
 			updateLastMessage,
+			setMessages,
 			user,
 			onShowAuth,
 			onShowUpgrade,
@@ -1003,7 +1004,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 							className="text-2xl font-bold mb-2"
 							style={{ color: "var(--color-text)" }}
 						>
-							CarBot
+							VinCritiq
 						</h1>
 						<p
 							className="text-base mb-1"
@@ -1140,7 +1141,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 					className="text-center text-xs mt-2"
 					style={{ color: "var(--color-muted)" }}
 				>
-					CarBot provides estimates for informational purposes only. Always
+					VinCritiq provides estimates for informational purposes only. Always
 					verify with a licensed dealer.
 				</p>
 			</div>
