@@ -4,9 +4,9 @@
 //   1. User uploaded photo  → upload to Tripo3D
 //   2. VIN available        → fetch stock photo URL via VinAudit → send URL to Tripo3D
 //   3. Neither              → return null (VehicleCanvas procedural fallback renders)
-
-const TRIPO_KEY    = process.env.REACT_APP_TRIPO_API_KEY;
-const VINAUDIT_KEY = process.env.REACT_APP_VINAUDIT_API_KEY;
+//
+// All upstream API keys are held server-side by Cloudflare Pages Functions.
+// Client talks to /api/tripo/* and /api/vinaudit only.
 
 // ─── Tripo3D ──────────────────────────────────────────────────────────────────
 
@@ -16,9 +16,8 @@ async function tripoSubmitFromFile(imageBase64, imageMediaType) {
   const form = new FormData();
   form.append('file', blob, 'vehicle.jpg');
 
-  const uploadRes = await fetch('https://api.tripo3d.ai/v2/openapi/upload', {
+  const uploadRes = await fetch('/api/tripo/upload', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${TRIPO_KEY}` },
     body: form,
   });
   if (!uploadRes.ok) throw new Error(`Tripo upload failed: ${uploadRes.status}`);
@@ -31,9 +30,9 @@ async function tripoSubmitFromUrl(imageUrl) {
 }
 
 async function tripoCreateTask(input) {
-  const res = await fetch('https://api.tripo3d.ai/v2/openapi/task', {
+  const res = await fetch('/api/tripo/task', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${TRIPO_KEY}`, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
   });
   if (!res.ok) throw new Error(`Tripo task failed: ${res.status}`);
@@ -42,9 +41,7 @@ async function tripoCreateTask(input) {
 }
 
 async function tripoPoll(taskId) {
-  const res = await fetch(`https://api.tripo3d.ai/v2/openapi/task/${taskId}`, {
-    headers: { Authorization: `Bearer ${TRIPO_KEY}` },
-  });
+  const res = await fetch(`/api/tripo/task/${taskId}`);
   if (!res.ok) throw new Error(`Tripo poll failed: ${res.status}`);
   const { data } = await res.json();
   // status: 'queued' | 'running' | 'success' | 'failed'
@@ -55,11 +52,9 @@ async function tripoPoll(taskId) {
 // ─── VinAudit stock photo ─────────────────────────────────────────────────────
 
 async function fetchVinAuditPhotoUrl(vin) {
-  if (!VINAUDIT_KEY || !vin) return null;
+  if (!vin) return null;
   try {
-    const res = await fetch(
-      `https://marketvalue.vinaudit.com/getmarketvalue.php?key=${VINAUDIT_KEY}&vin=${vin}&format=json`
-    );
+    const res = await fetch(`/api/vinaudit?vin=${encodeURIComponent(vin)}`);
     if (!res.ok) return null;
     const data = await res.json();
     // VinAudit Images API returns array of photo URLs under data.images
@@ -78,8 +73,6 @@ async function fetchVinAuditPhotoUrl(vin) {
  *   neither                      → returns null (use procedural fallback)
  */
 export async function submit3DJob(imageBase64, imageMediaType, vin) {
-  if (!TRIPO_KEY) return null;
-
   if (imageBase64 && imageMediaType) {
     // Path 1: user photo
     const taskId = await tripoSubmitFromFile(imageBase64, imageMediaType);

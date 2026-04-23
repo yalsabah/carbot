@@ -1,4 +1,3 @@
-const CLAUDE_API_KEY = process.env.REACT_APP_CLAUDE_API_KEY;
 const MODEL = 'claude-sonnet-4-20250514';
 
 const SYSTEM_PROMPT = (userMemory = '') => `You are VinCritiq, an expert AI vehicle deal analyst. You help users evaluate car deals by analyzing CARFAX reports, vehicle images, pricing data, and financing terms.
@@ -61,12 +60,10 @@ export async function* streamCarAnalysis({ carfaxText, imageBase64, imageMediaTy
 
   apiMessages.push({ role: 'user', content });
 
-  const response = await fetch('/api/claude/v1/messages', {
+  const response = await fetch('/api/claude', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': CLAUDE_API_KEY,
-      'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
       model: MODEL,
