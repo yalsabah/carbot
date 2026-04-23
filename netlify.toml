@@ -1,0 +1,25 @@
+[build]
+  base    = "."
+  publish = "build"
+  command = "npm run build"
+
+# Proxy /api/claude/* → Anthropic API
+[[redirects]]
+  from   = "/api/claude/*"
+  to     = "https://api.anthropic.com/:splat"
+  status = 200
+  force  = true
+
+# Proxy /api/rodin/* → https://api.hyper3d.com/api/v2/rodin/*
+# Mirrors the setupProxy.js pathRewrite: '^/api/rodin' → '/api/v2/rodin'
+[[redirects]]
+  from   = "/api/rodin/*"
+  to     = "https://api.hyper3d.com/api/v2/rodin/:splat"
+  status = 200
+  force  = true
+
+# SPA fallback — all unmatched routes serve index.html
+[[redirects]]
+  from   = "/*"
+  to     = "/index.html"
+  status = 200

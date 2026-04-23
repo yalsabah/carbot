@@ -14,7 +14,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { useChat } from "../contexts/ChatContext";
 import { parseReport, streamCarAnalysis } from "../utils/claudeApi";
-import { submitRodinJob, submitRodinJobFromVehicle, waitForRodinModel } from "../utils/hyper3d";
+import { submit3DJob, wait3DModel } from "../utils/model3d";
 import {
   extractTextFromPDF,
   fileToBase64,
@@ -516,22 +516,20 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 
 	// Start Hyper3D model generation in background after analysis completes
 	const startRodinJob = useCallback(
-		async (imageBase64, imageMediaType, prompt, vehicleFallback = null) => {
+		async (imageBase64, imageMediaType, _prompt, vehicle = null) => {
 			rodinAbort.current?.abort();
 			const controller = new AbortController();
 			rodinAbort.current = controller;
 			try {
-				const job = imageBase64
-					? await submitRodinJob(imageBase64, imageMediaType, prompt)
-					: await submitRodinJobFromVehicle(vehicleFallback);
+				const vin = vehicle?.vin ?? null;
+				const job = await submit3DJob(imageBase64, imageMediaType, vin);
 				if (!job || controller.signal.aborted) return;
 				setActiveReport((prev) =>
 					prev ? { ...prev, modelStatus: "Pending" } : prev,
 				);
-				const glbUrl = await waitForRodinModel(
-					job.taskUuid,
-					job.jobUuid,
-					(status) =>
+				const glbUrl = await wait3DModel(
+					job.taskId,
+					({ status }) =>
 						setActiveReport((prev) =>
 							prev ? { ...prev, modelStatus: status } : prev,
 						),
@@ -543,7 +541,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 					);
 				}
 			} catch {
-				// Hyper3D not configured or failed — silent
+				// 3D API not configured or failed — procedural fallback stays
 			}
 		},
 		[],
@@ -642,6 +640,24 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 				}
 			}
 
+			// Attach extracted inputs to the user message (in-memory only) so
+			// regenerate/edit can replay the same analysis with the same files.
+			setMessages((prev) => {
+				const copy = [...prev];
+				for (let i = copy.length - 1; i >= 0; i--) {
+					if (copy[i].role === "user") {
+						copy[i] = {
+							...copy[i],
+							_carfaxText: carfaxText,
+							_img64: imageBase64,
+							_imgMt: imageMediaType,
+						};
+						break;
+					}
+				}
+				return copy;
+			});
+
 			pushStep("Connecting to Claude…");
 			await consumeQuota();
 
@@ -721,6 +737,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 					role: "assistant",
 					text: fullText,
 					report: report || null,
+					_vehicleColor: vehicleColorRef || null,
 				});
 
 				if (report) {
@@ -868,10 +885,19 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			setIsAnalyzing(true);
 			let sessionId = activeSessionId;
 			if (!sessionId) sessionId = await createSession(newText.slice(0, 50));
+
+			// Preserve original CARFAX/image refs so regenerate re-sends the same inputs.
+			const carfaxText = msg._carfaxText || "";
+			const imageBase64 = msg._img64 || null;
+			const imageMediaType = msg._imgMt || null;
+
 			await addMessage(sessionId, {
 				role: "user",
 				text: newText,
 				files: msg.files,
+				_carfaxText: carfaxText,
+				_img64: imageBase64,
+				_imgMt: imageMediaType,
 			});
 			await consumeQuota();
 
@@ -881,7 +907,9 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			let fullText = "";
 			try {
 				const stream = streamCarAnalysis({
-					carfaxText: "",
+					carfaxText,
+					imageBase64,
+					imageMediaType,
 					messages: [...truncated, { role: "user", text: newText }],
 					userMemory: buildUserMemory(),
 				});

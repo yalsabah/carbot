@@ -82,6 +82,18 @@ export function ChatProvider({ children }) {
     }
   }, [user]);
 
+  // Firestore rejects `undefined` values — strip large/ephemeral fields and any undefined entries.
+  // Drops: isStreaming (transient), steps (transient UI), _img64/_imgMt (too large for Firestore 1MB doc limit).
+  // Keeps: _carfaxText (usually <50KB, needed for regenerate) and report (needed to re-open modal from history).
+  const sanitizeForFirestore = (message) => {
+    const { isStreaming, steps, _img64, _imgMt, ...rest } = message;
+    const clean = {};
+    for (const [k, v] of Object.entries(rest)) {
+      if (v !== undefined) clean[k] = v;
+    }
+    return clean;
+  };
+
   const addMessage = useCallback(async (sessionId, message) => {
     const optimistic = { ...message, id: Date.now().toString() };
     setMessages(prev => [...prev, optimistic]);
@@ -93,15 +105,15 @@ export function ChatProvider({ children }) {
       try {
         const ref = await addDoc(
           collection(db, 'users', user.uid, 'sessions', sessionId, 'messages'),
-          { ...message, createdAt: serverTimestamp() }
+          { ...sanitizeForFirestore(message), createdAt: serverTimestamp() }
         );
         await updateDoc(doc(db, 'users', user.uid, 'sessions', sessionId), {
           updatedAt: serverTimestamp(),
           ...(message.role === 'user' && message.text ? { title: message.text.slice(0, 50) } : {}),
         });
         setMessages(prev => prev.map(m => m.id === optimistic.id ? { ...m, id: ref.id } : m));
-      } catch {
-        // Firestore offline — message stays in local state only
+      } catch (err) {
+        console.error('addMessage: Firestore write failed', err);
       }
     }
   }, [user]);
@@ -112,11 +124,11 @@ export function ChatProvider({ children }) {
     try {
       await addDoc(
         collection(db, 'users', user.uid, 'sessions', sessionId, 'messages'),
-        { ...message, isStreaming: false, steps: undefined, createdAt: serverTimestamp() }
+        { ...sanitizeForFirestore(message), createdAt: serverTimestamp() }
       );
       await updateDoc(doc(db, 'users', user.uid, 'sessions', sessionId), { updatedAt: serverTimestamp() });
-    } catch {
-      // Firestore offline — skip persistence
+    } catch (err) {
+      console.error('persistLastMessage: Firestore write failed', err);
     }
   }, [user]);
 
