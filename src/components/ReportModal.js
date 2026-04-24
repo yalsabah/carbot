@@ -274,7 +274,7 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor }) {
       {!showGLB && modelStatus && modelStatus !== 'Done' && modelStatus !== 'Failed' && (
         <div
           className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium model-loading"
-          style={{ background: 'rgba(0,0,0,0.5)', color: 'rgba(255,255,255,0.9)', backdropFilter: 'blur(8px)' }}
+          style={{ background: 'var(--color-bg)', color: 'var(--color-text)', border: '1px solid var(--color-border)', backdropFilter: 'blur(8px)' }}
         >
           <Cpu size={11} />
           {modelStatus === 'Pending' ? 'Queued for 3D…' : 'Rendering 3D model…'}
@@ -285,7 +285,7 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor }) {
       {!showGLB && (
         <div
           className="absolute top-4 left-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold"
-          style={{ background: 'rgba(0,0,0,0.55)', color: 'rgba(255,255,255,0.72)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255,255,255,0.10)' }}
+          style={{ background: 'var(--color-bg)', color: 'var(--color-muted)', backdropFilter: 'blur(10px)', border: '1px solid var(--color-border)' }}
         >
           <Cpu size={10} />
           Pipeline 3D · Procedural
@@ -326,10 +326,10 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
       <div
         className={`flex w-full h-full ${exiting ? '' : 'modal-content-enter'}`}
       >
-        {/* Left: Vehicle visual */}
+        {/* Left: Vehicle visual — theme-aware (white in light, dark in dark) */}
         <div
           className="relative flex-shrink-0 overflow-hidden"
-          style={{ width: '42%', background: '#0a0f1a' }}
+          style={{ width: '42%', background: 'var(--color-surface)', borderRight: '1px solid var(--color-border)' }}
         >
           <LeftPanel
             vehicleColor={vehicleColor}
@@ -339,18 +339,18 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
             wheelColor="gunmetal"
           />
 
-          {/* Bottom gradient + info */}
+          {/* Bottom gradient + info — theme-aware fade so text stays legible */}
           <div
             className="absolute bottom-0 left-0 right-0 p-6"
-            style={{ background: 'linear-gradient(transparent, rgba(0,0,0,0.88) 55%)' }}
+            style={{ background: 'linear-gradient(transparent, var(--color-surface) 55%)' }}
           >
-            <div className="text-white font-bold text-xl leading-tight drop-shadow">
+            <div className="font-bold text-xl leading-tight" style={{ color: 'var(--color-text)' }}>
               {vehicleLabel || `${vehicle?.year} ${vehicle?.make} ${vehicle?.model}`}
             </div>
-            {vehicle?.trim && <div className="text-sm mt-0.5" style={{ color: 'rgba(255,255,255,0.65)' }}>{vehicle.trim}</div>}
-            {vehicle?.mileage && <div className="text-sm mt-1" style={{ color: 'rgba(255,255,255,0.5)' }}>{vehicle.mileage.toLocaleString()} miles</div>}
+            {vehicle?.trim && <div className="text-sm mt-0.5" style={{ color: 'var(--color-muted)' }}>{vehicle.trim}</div>}
+            {vehicle?.mileage && <div className="text-sm mt-1" style={{ color: 'var(--color-muted)', opacity: 0.8 }}>{vehicle.mileage.toLocaleString()} miles</div>}
             <div className="mt-3">{verdict?.rating && <VerdictBadge rating={verdict.rating} large />}</div>
-            <p className="text-xs mt-2" style={{ color: 'rgba(255,255,255,0.3)' }}>Drag to rotate · auto-spins</p>
+            <p className="text-xs mt-2" style={{ color: 'var(--color-muted)', opacity: 0.7 }}>Drag to rotate · auto-spins</p>
           </div>
         </div>
 
@@ -408,8 +408,10 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
             {metrics?.length > 0 && (
               <div>
                 <h3 className="text-xs font-bold uppercase tracking-wider mb-3" style={{ color: 'var(--color-muted)' }}>Key Metrics</h3>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                  {metrics.map((m, i) => <MetricCard key={i} m={m} />)}
+                {/* 2x2 on small screens, 1x4 on large — both layouts stay
+                    visually balanced regardless of metric count. */}
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  {metrics.slice(0, 4).map((m, i) => <MetricCard key={i} m={m} />)}
                 </div>
               </div>
             )}

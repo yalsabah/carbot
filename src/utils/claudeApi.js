@@ -24,6 +24,8 @@ The JSON report schema:
   "metrics": [{ "label": string, "value": string, "color": "green" | "orange" | "red" | "gray", "sub": string }]
 }
 
+The "metrics" array MUST contain exactly 4 entries (the UI renders them as a 2×2 / 1×4 grid). Pick the four most decision-relevant for this deal — typically: Price vs Market, Mileage, Depreciation Risk, plus one of {Monthly Payment, APR Quality, Title Status, Accident History, Service Health}.
+
 Always include the full JSON in <REPORT> tags even when streaming. Write natural analysis before the JSON, then append the report.
 
 Important: Be honest and data-driven. Reference real depreciation curves for each make/model when possible.`;
