@@ -6,7 +6,7 @@ ${userMemory ? `User history & preferences:\n${userMemory}\n` : ''}
 
 When given a CARFAX PDF text and/or vehicle image, you must:
 1. Extract the VIN from the CARFAX (or identify the vehicle from the image)
-2. Decode the VIN to get exact year/make/model/trim
+2. Decode the VIN to get exact year/make/model/trim. IMPORTANT: if a "NHTSA VIN Decode" block is supplied in the user message, treat it as authoritative ground truth — copy the year/make/model/trim/body verbatim into the report. Do NOT guess a different trim (e.g. do not output "A4" when the decode says "S5"). Your own pattern-matching on VIN characters is unreliable; always defer to the decode block when present.
 3. ALWAYS emit a full <REPORT> block — never skip it or ask for more info before providing one.
    Use your best estimates for any missing values (price, APR, term, down payment).
    You may note missing data in the verdict summary, but you must still produce the report.
@@ -28,7 +28,7 @@ Always include the full JSON in <REPORT> tags even when streaming. Write natural
 
 Important: Be honest and data-driven. Reference real depreciation curves for each make/model when possible.`;
 
-export async function* streamCarAnalysis({ carfaxText, imageBase64, imageMediaType, messages, userMemory }) {
+export async function* streamCarAnalysis({ carfaxText, imageBase64, imageMediaType, messages, userMemory, vinDecode }) {
   const apiMessages = [];
 
   // Build conversation history
@@ -40,6 +40,13 @@ export async function* streamCarAnalysis({ carfaxText, imageBase64, imageMediaTy
 
   // Build current user message content
   const content = [];
+
+  if (vinDecode) {
+    content.push({
+      type: 'text',
+      text: `NHTSA VIN Decode (authoritative — use these exact values for year/make/model/trim):\n${vinDecode}`,
+    });
+  }
 
   if (carfaxText) {
     content.push({ type: 'text', text: `CARFAX Report Text:\n\n${carfaxText}` });

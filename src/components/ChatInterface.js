@@ -15,6 +15,7 @@ import { useAuth } from "../contexts/AuthContext";
 import { useChat } from "../contexts/ChatContext";
 import { parseReport, streamCarAnalysis } from "../utils/claudeApi";
 import { submit3DJob, wait3DModel } from "../utils/model3d";
+import { decodeVin } from "../utils/vinDecode";
 import {
   extractTextFromPDF,
   fileToBase64,
@@ -478,6 +479,26 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 		await incrementUserUsage(user.uid, user.email);
 	}, [user]);
 
+	// Extract the first 17-char VIN from any of the given strings, then fetch
+	// a ground-truth decode block (Vincario → NHTSA fallback) for prompt
+	// injection. Returns null if no VIN found or both decoders failed.
+	const resolveVinDecode = useCallback(async (...sources) => {
+		const VIN_RE = /\b[A-HJ-NPR-Z0-9]{17}\b/;
+		let vin = null;
+		for (const s of sources) {
+			if (typeof s !== "string") continue;
+			const m = s.match(VIN_RE);
+			if (m) { vin = m[0]; break; }
+		}
+		if (!vin) return null;
+		try {
+			const decoded = await decodeVin(vin);
+			return decoded?.block || null;
+		} catch {
+			return null;
+		}
+	}, []);
+
 	const buildUserMemory = useCallback(() => {
 		if (!userDoc) return "";
 		const prefs = userDoc.preferences || {};
@@ -658,6 +679,24 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 				return copy;
 			});
 
+			// Ground-truth VIN decode (Vincario → NHTSA) injected into the prompt
+			// so Claude can't hallucinate the wrong trim (e.g. A4 vs S5).
+			const VIN_RE = /\b[A-HJ-NPR-Z0-9]{17}\b/;
+			const vinCandidate =
+				carfaxText.match(VIN_RE)?.[0] || userText.match(VIN_RE)?.[0] || null;
+			let vinDecodeBlock = null;
+			if (vinCandidate) {
+				pushStep(`Decoding VIN: ${vinCandidate}`);
+				vinDecodeBlock = await resolveVinDecode(carfaxText, userText);
+				if (vinDecodeBlock) {
+					// First line of the block is "(source: X)"; second is year make model
+					const short = vinDecodeBlock.split("\n")[1] || "decoded";
+					doneStep(steps.length - 1, `VIN decoded · ${short}`);
+				} else {
+					failStep(steps.length - 1, "VIN decode failed — proceeding without");
+				}
+			}
+
 			pushStep("Connecting to Claude…");
 			await consumeQuota();
 
@@ -669,6 +708,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 					imageMediaType,
 					messages: [...messages, { role: "user", text: userText }],
 					userMemory: buildUserMemory(),
+					vinDecode: vinDecodeBlock,
 				});
 
 				let streamStarted = false;
@@ -794,6 +834,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			buildUserMemory,
 			openReport,
 			startRodinJob,
+			resolveVinDecode,
 		],
 	);
 
@@ -822,12 +863,16 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			const streamMsg = { role: "assistant", text: "", isStreaming: true };
 			await addMessage(sessionId, streamMsg);
 
+			// Also decode any VIN in the free-text path so the model gets ground truth.
+			const vinDecodeBlock = await resolveVinDecode(text);
+
 			let fullText = "";
 			try {
 				const stream = streamCarAnalysis({
 					carfaxText: "",
 					messages: [...messages, { role: "user", text }],
 					userMemory: buildUserMemory(),
+					vinDecode: vinDecodeBlock,
 				});
 				for await (const chunk of stream) {
 					if (typeof chunk === "string") {
@@ -905,6 +950,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			const streamMsg = { role: "assistant", text: "", isStreaming: true };
 			await addMessage(sessionId, streamMsg);
 
+			const vinDecodeBlock = await resolveVinDecode(carfaxText, newText);
+
 			let fullText = "";
 			try {
 				const stream = streamCarAnalysis({
@@ -913,6 +960,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 					imageMediaType,
 					messages: [...truncated, { role: "user", text: newText }],
 					userMemory: buildUserMemory(),
+					vinDecode: vinDecodeBlock,
 				});
 				for await (const chunk of stream) {
 					if (typeof chunk === "string") {
@@ -967,6 +1015,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			updateLastMessage,
 			setMessages,
 			openReport,
+			resolveVinDecode,
 		],
 	);
 
@@ -1163,7 +1212,21 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 					imageMediaType={activeReport.imageMediaType}
 					glbUrl={activeReport.glbUrl}
 					modelStatus={activeReport.modelStatus}
+					isReanalyzing={isAnalyzing}
 					onClose={() => setShowReportModal(false)}
+					onConfirmEdits={(edits) => {
+						// Keep the modal open — activeReport will be swapped in place
+						// when the new <REPORT> streams back (openReport re-sets it).
+						const msg =
+							`Re-analyze this deal with these updated financing terms and give me a fresh <REPORT> using these exact numbers:\n` +
+							`- Sale Price: $${Math.round(edits.price).toLocaleString()}\n` +
+							`- Down Payment: $${Math.round(edits.downPayment).toLocaleString()}\n` +
+							`- APR: ${edits.apr}%\n` +
+							`- Term: ${edits.termMonths} months\n` +
+							`Computed on the client: monthly ≈ $${Math.round(edits.monthly).toLocaleString()}, total interest ≈ $${Math.round(edits.totalInterest).toLocaleString()}, total cost ≈ $${Math.round(edits.totalCost).toLocaleString()}.\n` +
+							`Re-evaluate the deal rating (Great/Good/Fair/Bad) given these terms and the same vehicle. Keep the vehicle, depreciation, and market values the same; only the financing block and verdict should change.`;
+						runAnalysis(msg);
+					}}
 				/>
 			)}
 		</div>
