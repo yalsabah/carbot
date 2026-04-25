@@ -14,7 +14,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { useChat } from "../contexts/ChatContext";
 import { parseReport, streamCarAnalysis } from "../utils/claudeApi";
-import { submit3DJob, wait3DModel } from "../utils/model3d";
+import { generateOrFetch3D } from "../utils/model3d";
 import { decodeVin } from "../utils/vinDecode";
 import {
   extractTextFromPDF,
@@ -176,6 +176,7 @@ function MessageBubble({
 	onCopy,
 	onRetry,
 	onViewReport,
+	onFeedback,
 	isLast,
 	isAnalyzing,
 }) {
@@ -389,18 +390,26 @@ function MessageBubble({
 						{!isUser && (
 							<>
 								<button
-									title="Good response"
-									className="p-1.5 rounded-lg transition-all"
-									style={{ color: "var(--color-muted)" }}
+									onClick={() => onFeedback?.(msg, msg.feedback === "up" ? null : "up")}
+									title={msg.feedback === "up" ? "Remove rating" : "Good response"}
+									className="p-1.5 rounded-lg transition-all hover:opacity-80"
+									style={{
+										color: msg.feedback === "up" ? "#16a34a" : "var(--color-muted)",
+										background: msg.feedback === "up" ? "rgba(22,163,74,0.12)" : "transparent",
+									}}
 								>
-									<ThumbsUp size={13} />
+									<ThumbsUp size={13} fill={msg.feedback === "up" ? "currentColor" : "none"} />
 								</button>
 								<button
-									title="Bad response"
-									className="p-1.5 rounded-lg transition-all"
-									style={{ color: "var(--color-muted)" }}
+									onClick={() => onFeedback?.(msg, msg.feedback === "down" ? null : "down")}
+									title={msg.feedback === "down" ? "Remove rating" : "Bad response"}
+									className="p-1.5 rounded-lg transition-all hover:opacity-80"
+									style={{
+										color: msg.feedback === "down" ? "#dc2626" : "var(--color-muted)",
+										background: msg.feedback === "down" ? "rgba(220,38,38,0.12)" : "transparent",
+									}}
 								>
-									<ThumbsDown size={13} />
+									<ThumbsDown size={13} fill={msg.feedback === "down" ? "currentColor" : "none"} />
 								</button>
 							</>
 						)}
@@ -422,6 +431,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 		persistLastMessage,
 		updateLastMessage,
 		setMessages,
+		recordFeedback,
 	} = useChat();
 	const [input, setInput] = useState("");
 	const [carfaxFile, setCarfaxFile] = useState(null);
@@ -535,30 +545,33 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 		[],
 	);
 
-	// Start Hyper3D model generation in background after analysis completes
+	// Kick off 3D pipeline. Trim-cache-first via the asset library:
+	//   - If models3d/{slug} is ready in Firestore → instant cache hit, no Tripo cost.
+	//   - Else this client claims, generates via Tripo3D, persists to R2.
+	//   - Concurrent clients on the same trim wait for the first one's result.
 	const startRodinJob = useCallback(
 		async (imageBase64, imageMediaType, _prompt, vehicle = null) => {
 			rodinAbort.current?.abort();
 			const controller = new AbortController();
 			rodinAbort.current = controller;
 			try {
-				const vin = vehicle?.vin ?? null;
-				const job = await submit3DJob(imageBase64, imageMediaType, vin);
-				if (!job || controller.signal.aborted) return;
-				setActiveReport((prev) =>
-					prev ? { ...prev, modelStatus: "Pending" } : prev,
-				);
-				const glbUrl = await wait3DModel(
-					job.taskId,
-					({ status }) =>
+				const result = await generateOrFetch3D({
+					vehicle,
+					imageBase64,
+					imageMediaType,
+					vin: vehicle?.vin ?? null,
+					onProgress: ({ status }) => {
+						if (controller.signal.aborted) return;
 						setActiveReport((prev) =>
 							prev ? { ...prev, modelStatus: status } : prev,
-						),
-					controller.signal,
-				);
-				if (glbUrl && !controller.signal.aborted) {
+						);
+					},
+					signal: controller.signal,
+				});
+				if (controller.signal.aborted) return;
+				if (result?.glbUrl) {
 					setActiveReport((prev) =>
-						prev ? { ...prev, glbUrl, modelStatus: "Done" } : prev,
+						prev ? { ...prev, glbUrl: result.glbUrl, modelStatus: "Done" } : prev,
 					);
 				}
 			} catch {
@@ -1122,6 +1135,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 								}
 								isLast={i === messages.length - 1}
 								isAnalyzing={isAnalyzing}
+								onFeedback={(m, value) => recordFeedback(activeSessionId, m.id, value)}
 							/>
 						))}
 						<div ref={bottomRef} />

@@ -38,6 +38,10 @@ export function AuthProvider({ children }) {
           promptsLimit: 3,
           lastReset: serverTimestamp(),
           preferences: {},
+          feedback: {
+            thumbsUp:   { count: 0, messages: [] },
+            thumbsDown: { count: 0, messages: [] },
+          },
           createdAt: serverTimestamp(),
           ...extraData,
         });

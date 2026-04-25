@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import {
-  collection, addDoc, updateDoc, doc, serverTimestamp, getDocs, deleteDoc
+  collection, addDoc, updateDoc, doc, serverTimestamp, getDocs, deleteDoc,
+  increment, arrayUnion, arrayRemove, getDoc, setDoc, Timestamp
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
 import { useAuth } from './AuthContext';
@@ -166,11 +167,112 @@ export function ChatProvider({ children }) {
     setMessages([]);
   }, []);
 
+  // Record a thumbs-up / thumbs-down on an assistant message.
+  // value: 'up' | 'down' | null  (null clears any existing vote)
+  // Maintains:
+  //   - per-message: messages/{id}.feedback + feedbackAt
+  //   - per-user aggregate at users/{uid}.feedback = {
+  //       thumbsUp:   { count, messages: [{ id, sessionId, preview, at }, ...] },
+  //       thumbsDown: { count, messages: [...] },
+  //     }
+  // Toggle-aware: re-clicking the same vote clears it; switching sides
+  // moves the entry from one list/counter to the other atomically.
+  const recordFeedback = useCallback(async (sessionId, messageId, value) => {
+    if (!messageId) return;
+    const next = value === 'up' || value === 'down' ? value : null;
+
+    // Find the message + previous feedback in local state (optimistic source of truth)
+    let prev = null;
+    let messageText = '';
+    setMessages(curr => {
+      const found = curr.find(m => m.id === messageId);
+      if (found) {
+        prev = found.feedback || null;
+        messageText = (found.text || found.content || '').replace(/<REPORT>[\s\S]*?<\/REPORT>/g, '').trim();
+      }
+      return curr.map(m => m.id === messageId ? { ...m, feedback: next } : m);
+    });
+
+    if (prev === next) return;
+    if (!user) return; // anonymous: optimistic-only, nothing to persist
+
+    // Persist on the message itself (only if it lives in Firestore)
+    if (sessionId && !sessionId.startsWith('local-') && !messageId.toString().match(/^\d+$/)) {
+      try {
+        await updateDoc(
+          doc(db, 'users', user.uid, 'sessions', sessionId, 'messages', messageId),
+          { feedback: next, feedbackAt: serverTimestamp() }
+        );
+      } catch (err) {
+        console.error('recordFeedback: per-message write failed', err);
+      }
+    }
+
+    // Update the per-user aggregate. We use a fixed-shape entry so arrayRemove
+    // can match exactly (Firestore array elements must be deeply equal).
+    // For arrayRemove to work after a later add, we must use a stable timestamp,
+    // not serverTimestamp() (which resolves to different values on add vs remove).
+    try {
+      const userRef = doc(db, 'users', user.uid);
+      const preview = messageText.slice(0, 120);
+
+      // We need a stable entry to write/remove. We read the doc once to find any
+      // existing entry for this messageId so removes match exactly.
+      const snap = await getDoc(userRef);
+      const fbDoc = snap.exists() ? (snap.data().feedback || {}) : {};
+      const upList = Array.isArray(fbDoc.thumbsUp?.messages) ? fbDoc.thumbsUp.messages : [];
+      const downList = Array.isArray(fbDoc.thumbsDown?.messages) ? fbDoc.thumbsDown.messages : [];
+
+      const existingUp = upList.find(e => e.id === messageId) || null;
+      const existingDown = downList.find(e => e.id === messageId) || null;
+
+      const updates = {};
+      const newEntry = { id: messageId, sessionId: sessionId || null, preview, at: Timestamp.now() };
+
+      if (prev === 'up' && existingUp) {
+        updates['feedback.thumbsUp.messages'] = arrayRemove(existingUp);
+        updates['feedback.thumbsUp.count'] = increment(-1);
+      }
+      if (prev === 'down' && existingDown) {
+        updates['feedback.thumbsDown.messages'] = arrayRemove(existingDown);
+        updates['feedback.thumbsDown.count'] = increment(-1);
+      }
+      if (next === 'up' && !existingUp) {
+        updates['feedback.thumbsUp.messages'] = arrayUnion(newEntry);
+        updates['feedback.thumbsUp.count'] = increment(1);
+      }
+      if (next === 'down' && !existingDown) {
+        updates['feedback.thumbsDown.messages'] = arrayUnion(newEntry);
+        updates['feedback.thumbsDown.count'] = increment(1);
+      }
+
+      // Firestore disallows a single update touching the same field with both
+      // arrayUnion AND arrayRemove. Our toggle/switch logic only ever hits each
+      // list with one operation per call, so this is safe — but if the doc
+      // doesn't have the parent map yet, ensure it exists first.
+      if (!snap.exists() || !snap.data().feedback) {
+        await setDoc(userRef, {
+          feedback: {
+            thumbsUp:   { count: 0, messages: [] },
+            thumbsDown: { count: 0, messages: [] },
+          },
+        }, { merge: true });
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await updateDoc(userRef, updates);
+      }
+    } catch (err) {
+      console.error('recordFeedback: aggregate write failed', err);
+    }
+  }, [user, setMessages]);
+
   return (
     <ChatContext.Provider value={{
       sessions, activeSessionId, messages, loadingSessions,
       loadSessions, createSession, loadSession, addMessage, persistLastMessage,
       updateLastMessage, deleteSession, startNewChat, setMessages,
+      recordFeedback,
     }}>
       {children}
     </ChatContext.Provider>

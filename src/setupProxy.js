@@ -97,6 +97,36 @@ module.exports = function (app) {
     }
   });
 
+  // Models (R2 GLB asset library) — mirrors functions/api/models/upload.js.
+  // In dev there's no R2 binding, so we don't actually persist the GLB; we just
+  // tell the orchestrator that no public URL was produced. It then falls back to
+  // using the original Tripo3D URL for the current session (no caching benefit
+  // in dev, but the modal still renders the model end-to-end).
+  app.post('/api/models/upload', async (req, res) => {
+    let body = req.body;
+    if (!body || typeof body !== 'object') {
+      try {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      } catch {
+        return res.status(400).json({ error: 'invalid_json' });
+      }
+    }
+    const { slug, sourceUrl } = body || {};
+    if (!slug || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(slug))) {
+      return res.status(400).json({ error: 'invalid_slug' });
+    }
+    if (!sourceUrl || typeof sourceUrl !== 'string') {
+      return res.status(400).json({ error: 'invalid_source_url' });
+    }
+    return res.json({ glbUrl: null, key: `models/${slug}.glb`, bytes: null, dev: true });
+  });
+
+  app.get('/api/models/upload', (_req, res) => {
+    res.json({ exists: false, reason: 'dev_no_bucket' });
+  });
+
   // VinAudit — server injects key into query string
   app.use(
     '/api/vinaudit',

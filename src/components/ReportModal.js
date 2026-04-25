@@ -52,9 +52,82 @@ function Row({ label, value, color }) {
   );
 }
 
-// GLB model renderer using @react-three/fiber
-function GLBScene({ url }) {
+// ─── Body color swatches ──────────────────────────────────────────────────────
+// 8 presets that span the typical paint range. `metalness` and `roughness` are
+// tuned per-color so light colors still look like paint and not plastic.
+// "id" is the only thing persisted to URL/state; everything else is presentation.
+const BODY_COLORS = [
+  { id: 'white',  label: 'White',  hex: '#eef0f2', metalness: 0.35, roughness: 0.45 },
+  { id: 'silver', label: 'Silver', hex: '#b8bdc4', metalness: 0.85, roughness: 0.30 },
+  { id: 'grey',   label: 'Grey',   hex: '#5a5e63', metalness: 0.60, roughness: 0.40 },
+  { id: 'black',  label: 'Black',  hex: '#1a1a1c', metalness: 0.55, roughness: 0.30 },
+  { id: 'red',    label: 'Red',    hex: '#b8211c', metalness: 0.50, roughness: 0.35 },
+  { id: 'blue',   label: 'Blue',   hex: '#1d3a8a', metalness: 0.50, roughness: 0.35 },
+  { id: 'green',  label: 'Green',  hex: '#1e5c3a', metalness: 0.50, roughness: 0.35 },
+  { id: 'yellow', label: 'Yellow', hex: '#d9a300', metalness: 0.40, roughness: 0.40 },
+];
+
+// Map a CARFAX/VIN-decoded color string to one of our preset IDs. Best effort.
+function inferColorIdFromVehicle(vehicle) {
+  const c = (vehicle?.color || '').toLowerCase();
+  if (!c) return null;
+  if (/white|pearl|ivory/.test(c)) return 'white';
+  if (/silver|alumin/.test(c)) return 'silver';
+  if (/black|onyx|obsidian/.test(c)) return 'black';
+  if (/grey|gray|graphite|gunmetal|charcoal/.test(c)) return 'grey';
+  if (/red|crimson|scarlet|maroon|burgundy/.test(c)) return 'red';
+  if (/blue|navy|cobalt|azure|sapphire/.test(c)) return 'blue';
+  if (/green|emerald|forest|olive/.test(c)) return 'green';
+  if (/yellow|gold|amber/.test(c)) return 'yellow';
+  return null;
+}
+
+// Walk the scene graph and recolor body panels only. Heuristics exclude wheels,
+// glass, lights, etc. Originals are cached on first call so we always recolor
+// from the source — no compounding tints if the user clicks multiple swatches.
+function applyBodyColor(scene, swatch) {
+  if (!scene || !swatch) return;
+  const isExcluded = (mat, mesh) => {
+    const name = ((mesh.name || '') + ' ' + (mat?.name || '')).toLowerCase();
+    if (/wheel|tire|tyre|rim|brake|caliper|window|glass|windshield|head\s*light|tail\s*light|light|mirror|grille|emblem|logo|plate|interior|seat/.test(name)) return true;
+    if (mat?.transparent || (mat?.opacity != null && mat.opacity < 0.9)) return true;
+    if (mat?.color) {
+      // Skip near-black materials — likely tires or trim already baked.
+      const { r, g, b } = mat.color;
+      if (r < 0.08 && g < 0.08 && b < 0.08) return true;
+    }
+    return false;
+  };
+
+  scene.traverse((obj) => {
+    if (!obj.isMesh || !obj.material) return;
+    if (!obj.userData.__originalMat) {
+      obj.userData.__originalMat = Array.isArray(obj.material)
+        ? obj.material.map(m => m.clone())
+        : obj.material.clone();
+    }
+    const recolor = (origMat) => {
+      if (isExcluded(origMat, obj)) return origMat.clone();
+      const next = origMat.clone();
+      if (next.color) next.color.set(swatch.hex);
+      if ('metalness' in next) next.metalness = swatch.metalness;
+      if ('roughness' in next) next.roughness = swatch.roughness;
+      next.needsUpdate = true;
+      return next;
+    };
+    obj.material = Array.isArray(obj.userData.__originalMat)
+      ? obj.userData.__originalMat.map(recolor)
+      : recolor(obj.userData.__originalMat);
+  });
+}
+
+// GLB model renderer using @react-three/fiber. Recolors body panels whenever
+// `swatch` changes — purely visual, never refetches the GLB.
+function GLBScene({ url, swatch }) {
   const { scene } = useGLTF(url);
+  useEffect(() => {
+    if (swatch) applyBodyColor(scene, swatch);
+  }, [scene, swatch]);
   return (
     <>
       <ambientLight intensity={0.8} />
@@ -64,6 +137,48 @@ function GLBScene({ url }) {
       <OrbitControls autoRotate autoRotateSpeed={1.5} enableZoom={false} maxPolarAngle={Math.PI / 2} />
       <Environment preset="city" />
     </>
+  );
+}
+
+function ColorSwatchRow({ activeId, onSelect }) {
+  return (
+    <div
+      className="absolute left-0 right-0 flex items-center justify-center gap-2 px-4"
+      style={{ bottom: 152, zIndex: 5 }}
+    >
+      <div
+        className="flex items-center gap-1.5 px-3 py-2 rounded-full"
+        style={{
+          background: 'var(--color-bg)',
+          border: '1px solid var(--color-border)',
+          backdropFilter: 'blur(10px)',
+        }}
+      >
+        {BODY_COLORS.map(c => {
+          const active = c.id === activeId;
+          return (
+            <button
+              key={c.id}
+              onClick={() => onSelect(c.id)}
+              title={c.label}
+              aria-label={`Color: ${c.label}`}
+              className="rounded-full transition-all"
+              style={{
+                width: 22,
+                height: 22,
+                background: c.hex,
+                border: active
+                  ? '2px solid var(--color-accent)'
+                  : '1px solid var(--color-border)',
+                boxShadow: active ? '0 0 0 2px var(--color-surface)' : 'none',
+                transform: active ? 'scale(1.15)' : 'scale(1)',
+                cursor: 'pointer',
+              }}
+            />
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -250,16 +365,17 @@ function FinancingEditor({ financing, pricing, onConfirmEdits, isReanalyzing }) 
   );
 }
 
-function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor }) {
+function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect }) {
   const showGLB = !!glbUrl;
   const bodyStyle = inferBodyStyle(vehicle);
+  const activeSwatch = BODY_COLORS.find(c => c.id === activeColorId) || null;
 
   return (
     <div style={{ position: 'absolute', inset: 0 }}>
       {showGLB ? (
-        // Tier 1 — AI-generated GLB from Hyper3D
+        // Tier 1 — AI-generated GLB from Tripo3D, persisted in R2 by trim
         <Canvas camera={{ position: [3, 1.5, 4], fov: 45 }} style={{ background: 'transparent' }}>
-          <GLBScene url={glbUrl} />
+          <GLBScene url={glbUrl} swatch={activeSwatch} />
         </Canvas>
       ) : (
         // Tier 2 — Pipeline procedural 3D (always — never fall back to photo)
@@ -268,6 +384,11 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor }) {
           wheelColor={wheelColor || 'gunmetal'}
           bodyStyle={bodyStyle}
         />
+      )}
+
+      {/* Color swatches — only meaningful when a real GLB is rendered */}
+      {showGLB && (
+        <ColorSwatchRow activeId={activeColorId} onSelect={onColorSelect} />
       )}
 
       {/* Hyper3D job status pill */}
@@ -298,6 +419,10 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor }) {
 export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, onClose, onConfirmEdits, isReanalyzing }) {
   const [exiting, setExiting] = useState(false);
   const closeTimer = useRef(null);
+  // Color picker state. Seeded from the CARFAX/decoded color when possible so
+  // the GLB opens with a tint that matches the actual car; user can override.
+  const inferredColorId = inferColorIdFromVehicle(report?.vehicle);
+  const [activeColorId, setActiveColorId] = useState(inferredColorId || 'white');
 
   const handleClose = () => {
     setExiting(true);
@@ -337,6 +462,8 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
             modelStatus={modelStatus}
             vehicle={vehicle}
             wheelColor="gunmetal"
+            activeColorId={activeColorId}
+            onColorSelect={setActiveColorId}
           />
 
           {/* Bottom gradient + info — theme-aware fade so text stays legible */}
