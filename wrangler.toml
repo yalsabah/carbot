@@ -19,3 +19,27 @@ pages_build_output_dir = "build"
 [[r2_buckets]]
 binding = "MODELS_BUCKET"
 bucket_name = "vincritiq-models"
+
+# Build-time environment variables. CRA bakes these into the client bundle
+# at build time via process.env.REACT_APP_*.
+#
+# Why these live here instead of in the Pages dashboard: Cloudflare's build
+# step wasn't injecting the dashboard's REACT_APP_FIREBASE_* plaintext vars
+# into `npm run build`, so every reference resolved to undefined and Firebase
+# threw `auth/invalid-api-key` on init. Declaring them here guarantees they
+# reach CRA regardless of dashboard quirks.
+#
+# IMPORTANT — only public-by-design values go here. The Firebase web config
+# is intentionally public (security is enforced by Firestore Security Rules
+# and App Check, not by hiding these IDs). Real secrets — Claude API key,
+# Tripo3D key, VinAudit key, Vincario key/secret — stay in the Cloudflare
+# dashboard as encrypted Secrets and are NEVER added to this file.
+[vars]
+REACT_APP_FIREBASE_API_KEY             = "AIzaSyAS5V7JjUDUdU8BhMN9cUj13x9hGOAvcOg"
+REACT_APP_FIREBASE_AUTH_DOMAIN         = "carbot-77c32.firebaseapp.com"
+REACT_APP_FIREBASE_PROJECT_ID          = "carbot-77c32"
+REACT_APP_FIREBASE_STORAGE_BUCKET      = "carbot-77c32.firebasestorage.app"
+REACT_APP_FIREBASE_MESSAGING_SENDER_ID = "639263980314"
+REACT_APP_FIREBASE_APP_ID              = "1:639263980314:web:96db6e565c6b18bd4d8aa3"
+REACT_APP_FIREBASE_MEASUREMENT_ID      = "G-JJ0S85KE2D"
+GENERATE_SOURCEMAP                     = "false"
