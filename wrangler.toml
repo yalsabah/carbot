@@ -1,0 +1,21 @@
+# Cloudflare Pages — Functions configuration.
+#
+# We deliberately declare the R2 binding here (rather than only in the dashboard)
+# because the dashboard UI has a long-standing bug where it serializes an empty
+# `jurisdiction` field on R2 bindings, which wrangler rejects with:
+#   "binding MODELS_BUCKET of type r2_bucket contains an invalid jurisdiction"
+#
+# When a wrangler.toml is present at the project root, Pages uses it as the
+# source of truth for bindings during the build — no jurisdiction field, no
+# error. Dashboard env vars (CLAUDE_API_KEY, MODELS_PUBLIC_BASE, etc.) still
+# come from the dashboard; only bindings declared here are overridden.
+
+name = "vincritiq"
+compatibility_date = "2024-12-01"
+pages_build_output_dir = "build"
+
+# R2 — GLB asset library. The bucket is in WNAM (location hint, not a
+# jurisdiction); intentionally omit `jurisdiction = "..."`.
+[[r2_buckets]]
+binding = "MODELS_BUCKET"
+bucket_name = "vincritiq-models"
