@@ -130,17 +130,42 @@ export function ChatProvider({ children }) {
     }
   }, [user]);
 
-  // Called after streaming completes to persist the final assistant message
+  // Called after streaming completes to persist the final assistant message.
+  // Returns the new doc ID (or null if not persisted) so callers can update
+  // the message later — e.g. to attach 3D-generation cost once it lands.
   const persistLastMessage = useCallback(async (sessionId, message) => {
-    if (!user || !sessionId || sessionId.startsWith('local-')) return;
+    if (!user || !sessionId || sessionId.startsWith('local-')) return null;
     try {
-      await addDoc(
+      const ref = await addDoc(
         collection(db, 'users', user.uid, 'sessions', sessionId, 'messages'),
         { ...sanitizeForFirestore(message), createdAt: serverTimestamp() }
       );
       await updateDoc(doc(db, 'users', user.uid, 'sessions', sessionId), { updatedAt: serverTimestamp() });
+      return ref.id;
     } catch (err) {
       console.error('persistLastMessage: Firestore write failed', err);
+      return null;
+    }
+  }, [user]);
+
+  // Patch a single field (or several) on a previously-persisted assistant
+  // message. Used to refresh `totalCost` once 3D generation finishes after
+  // the message was already saved.
+  const updateMessage = useCallback(async (sessionId, messageId, patch) => {
+    if (!user || !sessionId || !messageId) return;
+    if (sessionId.startsWith('local-')) return;
+    try {
+      const clean = {};
+      for (const [k, v] of Object.entries(patch || {})) {
+        if (v !== undefined) clean[k] = v;
+      }
+      if (Object.keys(clean).length === 0) return;
+      await updateDoc(
+        doc(db, 'users', user.uid, 'sessions', sessionId, 'messages', messageId),
+        clean
+      );
+    } catch (err) {
+      console.error('updateMessage: Firestore write failed', err);
     }
   }, [user]);
 
@@ -271,7 +296,7 @@ export function ChatProvider({ children }) {
     <ChatContext.Provider value={{
       sessions, activeSessionId, messages, loadingSessions,
       loadSessions, createSession, loadSession, addMessage, persistLastMessage,
-      updateLastMessage, deleteSession, startNewChat, setMessages,
+      updateLastMessage, updateMessage, deleteSession, startNewChat, setMessages,
       recordFeedback,
     }}>
       {children}

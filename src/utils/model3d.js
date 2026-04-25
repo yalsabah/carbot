@@ -248,6 +248,7 @@ export async function generateOrFetch3D({
   imageMediaType,
   vin,
   onProgress,
+  onCost,    // optional ({ label, amount, detail }) — fires once per paid event
   signal,
 } = {}) {
   const slug = buildModelSlug(vehicle);
@@ -265,6 +266,7 @@ export async function generateOrFetch3D({
 
     if (claim?.action === 'cache_hit') {
       onProgress?.({ status: 'CacheHit', progress: 100 });
+      // Cache hit — no costs incurred at all (no Tripo3D, no VinAudit image lookup).
       return { glbUrl: claim.glbUrl, slug, fromCache: true };
     }
     if (claim?.action === 'wait') {
@@ -287,6 +289,11 @@ export async function generateOrFetch3D({
     if (slug && claim?.action === 'claim') await markFailed(slug, 'no_source_image');
     return null;
   }
+  // Costs are committed at submit time — Tripo doesn't refund failed jobs.
+  if (job.source === 'vinaudit') {
+    onCost?.({ label: 'VinAudit (image lookup)', amount: 0.05, detail: 'stock photo for 3D' });
+  }
+  onCost?.({ label: 'Tripo3D image-to-3D', amount: 0.30, detail: `source: ${job.source}` });
   onProgress?.({ status: 'Pending', progress: 0 });
 
   let tripoGlbUrl;

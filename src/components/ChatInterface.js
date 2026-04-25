@@ -2,7 +2,10 @@ import {
   Award,
   Car,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
+  DollarSign,
   ExternalLink,
   Pencil,
   RotateCcw,
@@ -15,6 +18,7 @@ import { useAuth } from "../contexts/AuthContext";
 import { useChat } from "../contexts/ChatContext";
 import { parseReport, streamCarAnalysis } from "../utils/claudeApi";
 import { generateOrFetch3D } from "../utils/model3d";
+import { createCostAccumulator, FIXED_COSTS, formatUsd } from "../utils/pricing";
 import { decodeVin } from "../utils/vinDecode";
 import {
   extractTextFromPDF,
@@ -169,6 +173,74 @@ function MiniVerdict({ rating }) {
 
 const USER_MSG_COLLAPSE_THRESHOLD = 400;
 
+// ─── Dev-only cost badge ──────────────────────────────────────────────────────
+// Renders a small "$0.0432" pill under the assistant message; click expands a
+// per-line breakdown of every paid API call that contributed to the response
+// (Claude tokens, Vincario, VinAudit image lookup, Tripo3D, etc.). Only shown
+// to admin users — see isAdmin() in utils/usage.js.
+function CostBadge({ totalCost }) {
+	const [open, setOpen] = useState(false);
+	if (!totalCost || typeof totalCost.total !== "number") return null;
+	const items = Array.isArray(totalCost.items) ? totalCost.items : [];
+	return (
+		<div className="mt-1.5">
+			<button
+				onClick={() => setOpen((o) => !o)}
+				title="Developer cost breakdown"
+				className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono transition-all hover:opacity-80"
+				style={{
+					background: "var(--color-bg)",
+					border: "1px dashed var(--color-border)",
+					color: "var(--color-muted)",
+				}}
+			>
+				<DollarSign size={10} />
+				{formatUsd(totalCost.total)}
+				<span className="opacity-60 ml-1">dev</span>
+				{open ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+			</button>
+			{open && (
+				<div
+					className="mt-1.5 rounded-lg p-2 text-[11px] font-mono"
+					style={{
+						background: "var(--color-bg)",
+						border: "1px solid var(--color-border)",
+						color: "var(--color-text)",
+						maxWidth: 380,
+					}}
+				>
+					{items.length === 0 ? (
+						<div style={{ color: "var(--color-muted)" }}>No paid items recorded.</div>
+					) : (
+						<div className="space-y-0.5">
+							{items.map((it, i) => (
+								<div key={i} className="flex items-baseline justify-between gap-3">
+									<span className="truncate">
+										{it.label}
+										{it.detail && (
+											<span className="opacity-60"> · {it.detail}</span>
+										)}
+									</span>
+									<span style={{ color: "var(--color-muted)" }}>
+										{formatUsd(it.amount)}
+									</span>
+								</div>
+							))}
+							<div
+								className="flex items-baseline justify-between pt-1 mt-1 font-bold"
+								style={{ borderTop: "1px solid var(--color-border)" }}
+							>
+								<span>Total</span>
+								<span>{formatUsd(totalCost.total)}</span>
+							</div>
+						</div>
+					)}
+				</div>
+			)}
+		</div>
+	);
+}
+
 // ─── Message bubble ────────────────────────────────────────────────────────────
 function MessageBubble({
 	msg,
@@ -179,6 +251,7 @@ function MessageBubble({
 	onFeedback,
 	isLast,
 	isAnalyzing,
+	isDev,
 }) {
 	const isUser = msg.role === "user";
 	const [hovered, setHovered] = useState(false);
@@ -350,6 +423,11 @@ function MessageBubble({
 					</div>
 				)}
 
+				{/* Dev-only cost breakdown */}
+				{!isUser && isDev && msg.totalCost && !msg.isStreaming && (
+					<CostBadge totalCost={msg.totalCost} />
+				)}
+
 				{/* Action buttons */}
 				{!editing && !msg.isStreaming && hovered && (
 					<div
@@ -430,6 +508,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 		addMessage,
 		persistLastMessage,
 		updateLastMessage,
+		updateMessage,
 		setMessages,
 		recordFeedback,
 	} = useChat();
@@ -492,6 +571,9 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 	// Extract the first 17-char VIN from any of the given strings, then fetch
 	// a ground-truth decode block (Vincario → NHTSA fallback) for prompt
 	// injection. Returns null if no VIN found or both decoders failed.
+	// Returns { block, source } — source is 'vincario' | 'nhtsa' so callers
+	// can attribute paid-API costs correctly. Returns null when no VIN found
+	// or both decoders fail.
 	const resolveVinDecode = useCallback(async (...sources) => {
 		const VIN_RE = /\b[A-HJ-NPR-Z0-9]{17}\b/;
 		let vin = null;
@@ -503,7 +585,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 		if (!vin) return null;
 		try {
 			const decoded = await decodeVin(vin);
-			return decoded?.block || null;
+			if (!decoded?.block) return null;
+			return { block: decoded.block, source: decoded.source || 'unknown' };
 		} catch {
 			return null;
 		}
@@ -549,8 +632,12 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 	//   - If models3d/{slug} is ready in Firestore → instant cache hit, no Tripo cost.
 	//   - Else this client claims, generates via Tripo3D, persists to R2.
 	//   - Concurrent clients on the same trim wait for the first one's result.
+	//
+	// Costs accrued here (VinAudit image lookup, Tripo3D generation) are pushed
+	// through `cost` and re-persisted to the assistant message via `messageId`,
+	// since startRodinJob runs *after* the message has already been saved.
 	const startRodinJob = useCallback(
-		async (imageBase64, imageMediaType, _prompt, vehicle = null) => {
+		async (imageBase64, imageMediaType, _prompt, vehicle = null, cost = null, sessionId = null, messageId = null) => {
 			rodinAbort.current?.abort();
 			const controller = new AbortController();
 			rodinAbort.current = controller;
@@ -566,6 +653,15 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 							prev ? { ...prev, modelStatus: status } : prev,
 						);
 					},
+					onCost: (item) => {
+						if (!cost) return;
+						cost.add(item.label, item.amount, item.detail);
+						const snap = cost.snapshot();
+						updateLastMessage((prev) => ({ ...prev, totalCost: snap }));
+						if (sessionId && messageId) {
+							updateMessage(sessionId, messageId, { totalCost: snap });
+						}
+					},
 					signal: controller.signal,
 				});
 				if (controller.signal.aborted) return;
@@ -578,7 +674,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 				// 3D API not configured or failed — procedural fallback stays
 			}
 		},
-		[],
+		[updateLastMessage, updateMessage],
 	);
 
 	const runAnalysis = useCallback(
@@ -593,6 +689,12 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 				else onShowUpgrade();
 				return;
 			}
+
+			// Per-analysis cost accumulator. Items get pushed as paid APIs fire
+			// (Vincario decode, Claude streaming, VinAudit lookup, Tripo3D job).
+			// Final snapshot is persisted on the assistant message; the dev-only
+			// CostBadge in MessageBubble reads from there.
+			const cost = createCostAccumulator();
 
 			let sessionId = activeSessionId;
 			if (!sessionId) sessionId = await createSession("Vehicle Assessment");
@@ -698,10 +800,16 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			const vinCandidate =
 				carfaxText.match(VIN_RE)?.[0] || userText.match(VIN_RE)?.[0] || null;
 			let vinDecodeBlock = null;
+			let vinDecodeSource = null;
 			if (vinCandidate) {
 				pushStep(`Decoding VIN: ${vinCandidate}`);
-				vinDecodeBlock = await resolveVinDecode(carfaxText, userText);
-				if (vinDecodeBlock) {
+				const vinResult = await resolveVinDecode(carfaxText, userText);
+				if (vinResult) {
+					vinDecodeBlock = vinResult.block;
+					vinDecodeSource = vinResult.source;
+					if (vinDecodeSource === 'vincario') {
+						cost.add('Vincario decode', FIXED_COSTS.vincario_decode, 'paid VIN decode');
+					}
 					// First line of the block is "(source: X)"; second is year make model
 					const short = vinDecodeBlock.split("\n")[1] || "decoded";
 					doneStep(steps.length - 1, `VIN decoded · ${short}`);
@@ -753,6 +861,10 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 						} else {
 							updateLastMessage((prev) => ({ ...prev, text: _ft }));
 						}
+					} else if (chunk?.type === "usage") {
+						// Anthropic message_delta carries token usage at the end of the stream.
+						// Translate into priced line items via the accumulator.
+						cost.addClaudeUsage(chunk.usage);
 					}
 				}
 
@@ -775,6 +887,10 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 					doneStep(steps.length - 1, `Response complete · ${charCount} chars`);
 				}
 
+				// Snapshot the cost so far (Vincario + Claude). 3D costs are added
+				// later by startRodinJob via updateMessage.
+				const costSnapshot = cost.snapshot();
+
 				// Store image refs and vehicleColor in message so "View Full Report" works from history
 				updateLastMessage((prev) => ({
 					...prev,
@@ -785,12 +901,14 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 					_img64: imageBase64,
 					_imgMt: imageMediaType,
 					_vehicleColor: vehicleColorRef,
+					totalCost: costSnapshot,
 				}));
-				persistLastMessage(sessionId, {
+				const persistedId = await persistLastMessage(sessionId, {
 					role: "assistant",
 					text: fullText,
 					report: report || null,
 					_vehicleColor: vehicleColorRef || null,
+					totalCost: costSnapshot,
 				});
 
 				if (report) {
@@ -804,11 +922,11 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 						imageBase64,
 						imageMediaType,
 					);
-					// Kick off Hyper3D 3D model generation in background.
-					// If the user attached a photo, use it. Otherwise fall back to
-					// text-to-3D using the decoded vehicle data (VIN path).
+					// Kick off 3D model generation in background. Pass the cost
+					// accumulator + persisted message ID so VinAudit/Tripo costs
+					// land on the same message once they fire.
 					const prompt = `${vLabel} exterior, realistic car`;
-					startRodinJob(imageBase64, imageMediaType, prompt, report.vehicle);
+					startRodinJob(imageBase64, imageMediaType, prompt, report.vehicle, cost, sessionId, persistedId);
 				}
 			} catch (err) {
 				failStep(steps.length - 1, `Failed: ${err.message}`);
@@ -866,6 +984,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 				return;
 			}
 
+			const cost = createCostAccumulator();
+
 			let sessionId = activeSessionId;
 			if (!sessionId) sessionId = await createSession(text.slice(0, 50));
 			await addMessage(sessionId, { role: "user", text });
@@ -877,7 +997,11 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			await addMessage(sessionId, streamMsg);
 
 			// Also decode any VIN in the free-text path so the model gets ground truth.
-			const vinDecodeBlock = await resolveVinDecode(text);
+			const vinResult = await resolveVinDecode(text);
+			const vinDecodeBlock = vinResult?.block || null;
+			if (vinResult?.source === 'vincario') {
+				cost.add('Vincario decode', FIXED_COSTS.vincario_decode, 'paid VIN decode');
+			}
 
 			let fullText = "";
 			try {
@@ -892,19 +1016,24 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 						fullText += chunk;
 						const _ft = fullText;
 						updateLastMessage((prev) => ({ ...prev, text: _ft }));
+					} else if (chunk?.type === "usage") {
+						cost.addClaudeUsage(chunk.usage);
 					}
 				}
 				const report = parseReport(fullText);
+				const costSnapshot = cost.snapshot();
 				updateLastMessage((prev) => ({
 					...prev,
 					isStreaming: false,
 					text: fullText,
 					report,
+					totalCost: costSnapshot,
 				}));
 				persistLastMessage(sessionId, {
 					role: "assistant",
 					text: fullText,
 					report: report || null,
+					totalCost: costSnapshot,
 				});
 				if (report) {
 					const label =
@@ -942,6 +1071,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			}
 
 			setIsAnalyzing(true);
+			const cost = createCostAccumulator();
 			let sessionId = activeSessionId;
 			if (!sessionId) sessionId = await createSession(newText.slice(0, 50));
 
@@ -963,7 +1093,11 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 			const streamMsg = { role: "assistant", text: "", isStreaming: true };
 			await addMessage(sessionId, streamMsg);
 
-			const vinDecodeBlock = await resolveVinDecode(carfaxText, newText);
+			const vinResult = await resolveVinDecode(carfaxText, newText);
+			const vinDecodeBlock = vinResult?.block || null;
+			if (vinResult?.source === 'vincario') {
+				cost.add('Vincario decode', FIXED_COSTS.vincario_decode, 'paid VIN decode');
+			}
 
 			let fullText = "";
 			try {
@@ -980,19 +1114,24 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 						fullText += chunk;
 						const _ft = fullText;
 						updateLastMessage((prev) => ({ ...prev, text: _ft }));
+					} else if (chunk?.type === "usage") {
+						cost.addClaudeUsage(chunk.usage);
 					}
 				}
 				const report = parseReport(fullText);
+				const costSnapshot = cost.snapshot();
 				updateLastMessage((prev) => ({
 					...prev,
 					isStreaming: false,
 					text: fullText,
 					report,
+					totalCost: costSnapshot,
 				}));
 				persistLastMessage(sessionId, {
 					role: "assistant",
 					text: fullText,
 					report: report || null,
+					totalCost: costSnapshot,
 				});
 				if (report) {
 					const label =
@@ -1135,6 +1274,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth }) {
 								}
 								isLast={i === messages.length - 1}
 								isAnalyzing={isAnalyzing}
+								isDev={isAdmin(user?.email)}
 								onFeedback={(m, value) => recordFeedback(activeSessionId, m.id, value)}
 							/>
 						))}
