@@ -1,8 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { X, Award, DollarSign, BarChart2, TrendingDown, Cpu, RotateCcw, Sliders, RefreshCw } from 'lucide-react';
-import { Canvas } from '@react-three/fiber';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { X, Award, DollarSign, BarChart2, TrendingDown, Cpu, RotateCcw, Sliders, RefreshCw, Image as ImageIcon, Box } from 'lucide-react';
+import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, useGLTF, Environment } from '@react-three/drei';
+import * as THREE from 'three';
 import VehicleCanvas from './VehicleCanvas';
+import { fetchVinAuditImages } from '../utils/vinAuditImages';
 
 const fmt = (n, prefix = '') => {
   if (n == null) return '—';
@@ -82,59 +84,193 @@ function inferColorIdFromVehicle(vehicle) {
   return null;
 }
 
-// Walk the scene graph and recolor body panels only. Heuristics exclude wheels,
-// glass, lights, etc. Originals are cached on first call so we always recolor
-// from the source — no compounding tints if the user clicks multiple swatches.
+// Tripo3D returns a single merged mesh with one material — there are no
+// "body" vs "wheel" submeshes to look up by name. So instead of trying to
+// detect parts via mesh names (which always finds nothing), we tint per
+// PIXEL via shader injection:
+//
+//   - High saturation (taillights, badges, painted emblems) → preserve
+//   - Very low luminance (tires, rubber, dark grilles)      → preserve
+//   - Mid-saturation, mid-luminance (body paint)            → tint
+//
+// The result: rims, glass, lights, and trim keep their original look while
+// the body color responds to the swatch picker. The mask is computed against
+// the texture's albedo, so it works regardless of how the GLB is structured.
+function buildBodyTintCompiler(swatch) {
+  const tintColor = new THREE.Color(swatch.hex);
+  return (shader) => {
+    shader.uniforms.uBodyTint = { value: tintColor };
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+        uniform vec3 uBodyTint;`
+      )
+      .replace(
+        '#include <map_fragment>',
+        `#include <map_fragment>
+        {
+          vec3 _albedo = diffuseColor.rgb;
+          float _maxC = max(max(_albedo.r, _albedo.g), _albedo.b);
+          float _minC = min(min(_albedo.r, _albedo.g), _albedo.b);
+          // Saturation in [0, 1]; near-zero means grayscale (paint candidate).
+          float _sat = (_maxC > 0.001) ? (_maxC - _minC) / _maxC : 0.0;
+          // Luminance in [0, 1]; very low = tire/rubber, exclude.
+          float _lum = (_maxC + _minC) * 0.5;
+          float _satMask = 1.0 - smoothstep(0.18, 0.45, _sat);
+          float _lumMask = smoothstep(0.06, 0.22, _lum);
+          float _mask = _satMask * _lumMask;
+          diffuseColor.rgb = mix(_albedo, _albedo * uBodyTint, _mask);
+        }`
+      );
+  };
+}
+
 function applyBodyColor(scene, swatch) {
   if (!scene || !swatch) return;
-  const isExcluded = (mat, mesh) => {
-    const name = ((mesh.name || '') + ' ' + (mat?.name || '')).toLowerCase();
-    if (/wheel|tire|tyre|rim|brake|caliper|window|glass|windshield|head\s*light|tail\s*light|light|mirror|grille|emblem|logo|plate|interior|seat/.test(name)) return true;
-    if (mat?.transparent || (mat?.opacity != null && mat.opacity < 0.9)) return true;
-    if (mat?.color) {
-      // Skip near-black materials — likely tires or trim already baked.
-      const { r, g, b } = mat.color;
-      if (r < 0.08 && g < 0.08 && b < 0.08) return true;
-    }
-    return false;
-  };
+  const compiler = buildBodyTintCompiler(swatch);
 
   scene.traverse((obj) => {
     if (!obj.isMesh || !obj.material) return;
+
+    // Cache the original material(s) once so subsequent retints always start
+    // from the source — no compounding tints if the user picks several swatches.
     if (!obj.userData.__originalMat) {
       obj.userData.__originalMat = Array.isArray(obj.material)
-        ? obj.material.map(m => m.clone())
+        ? obj.material.map((m) => m.clone())
         : obj.material.clone();
     }
-    const recolor = (origMat) => {
-      if (isExcluded(origMat, obj)) return origMat.clone();
+
+    const apply = (origMat) => {
+      // Skip transparent materials entirely (windows, glass, headlight covers).
+      if (origMat.transparent || (origMat.opacity != null && origMat.opacity < 0.9)) {
+        return origMat.clone();
+      }
       const next = origMat.clone();
-      if (next.color) next.color.set(swatch.hex);
+      next.onBeforeCompile = compiler;
+      // Force shader recompile — Three.js caches by program key, and changing
+      // onBeforeCompile alone won't trigger a rebuild without this flag.
+      next.customProgramCacheKey = () => `body-tint-${swatch.id}`;
       if ('metalness' in next) next.metalness = swatch.metalness;
       if ('roughness' in next) next.roughness = swatch.roughness;
       next.needsUpdate = true;
       return next;
     };
+
     obj.material = Array.isArray(obj.userData.__originalMat)
-      ? obj.userData.__originalMat.map(recolor)
-      : recolor(obj.userData.__originalMat);
+      ? obj.userData.__originalMat.map(apply)
+      : apply(obj.userData.__originalMat);
   });
 }
 
-// GLB model renderer using @react-three/fiber. Recolors body panels whenever
-// `swatch` changes — purely visual, never refetches the GLB.
+// GLB model renderer with dynamic camera fitting.
+//
+// Two problems a static camera/scale couldn't solve:
+//
+//   1. Tripo3D output scales vary wildly (0.5 to 5 world units). A fixed
+//      `scale={1.2}` renders some cars huge and others tiny.
+//   2. The panel is taller than wide and cars are wider than tall — the
+//      model's "fill" is bounded by horizontal viewport at most rotations
+//      but vertical at others (during auto-rotate). A static camera distance
+//      either crops or under-fills depending on the angle.
+//
+// Solution: measure the model's bounding box and compute the camera distance
+// that fits the worst-case projected size into the panel. OrbitControls'
+// target is pinned to the body's actual center (not a hardcoded y) so the
+// model stays centered regardless of its height.
+//
+// Also resets the scene's transform on each mount because useGLTF returns a
+// globally cached scene — a previous mount may have left scale/position
+// modified, which would corrupt the bounding box measurement.
 function GLBScene({ url, swatch }) {
   const { scene } = useGLTF(url);
+  const { camera, size: viewport } = useThree();
+  const [orbitTarget, setOrbitTarget] = useState(() => [0, 0, 0]);
+
+  useLayoutEffect(() => {
+    if (!viewport.width || !viewport.height) return;
+
+    // Reset transforms in case this scene was previously mounted and scaled.
+    scene.position.set(0, 0, 0);
+    scene.scale.setScalar(1);
+    scene.updateMatrixWorld(true);
+
+    // 1. Measure the unscaled model.
+    const rawBox = new THREE.Box3().setFromObject(scene);
+    const rawSize = rawBox.getSize(new THREE.Vector3());
+    const rawCenter = rawBox.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(rawSize.x, rawSize.y, rawSize.z) || 1;
+
+    // 2. Normalize to a 4-unit reference so the camera fit math is stable.
+    const fit = 4.0 / maxDim;
+    scene.scale.setScalar(fit);
+    scene.position.set(
+      -rawCenter.x * fit,
+      -rawBox.min.y * fit,   // bottom touches y=0 so the car sits on the ground
+      -rawCenter.z * fit,
+    );
+    scene.updateMatrixWorld(true);
+
+    // 3. Re-measure after normalization for the camera-fit step.
+    const fittedBox = new THREE.Box3().setFromObject(scene);
+    const fittedSize = fittedBox.getSize(new THREE.Vector3());
+    const fittedCenter = fittedBox.getCenter(new THREE.Vector3());
+
+    // 4. Compute the camera distance that fits the panel.
+    //
+    //    Worst-case width during a y-axis rotation = max(x, z). At any
+    //    rotation the projected silhouette is bounded by this value.
+    //    Vertical extent doesn't change during y-rotation.
+    //
+    //    fitRatio < 1 means the model fills more (tighter) — 0.85 leaves a
+    //    small margin so wheels and bumpers don't kiss the panel edges
+    //    during full rotation.
+    const aspect = viewport.width / viewport.height;
+    const fov = (camera.fov * Math.PI) / 180;
+    const fitRatio = 0.85;
+    const projWidth = Math.max(fittedSize.x, fittedSize.z);
+    const projHeight = fittedSize.y;
+    const distH = projHeight / fitRatio / (2 * Math.tan(fov / 2));
+    const distW = projWidth / fitRatio / (2 * Math.tan(fov / 2) * aspect);
+    const distance = Math.max(distH, distW);
+
+    // 5. Place camera at a 3/4 angle and look at the body center.
+    const dir = new THREE.Vector3(0.55, 0.4, 0.75).normalize();
+    camera.position.set(
+      fittedCenter.x + dir.x * distance,
+      fittedCenter.y + dir.y * distance,
+      fittedCenter.z + dir.z * distance,
+    );
+    camera.lookAt(fittedCenter);
+    camera.near = Math.max(0.1, distance / 100);
+    camera.far = distance * 100;
+    camera.updateProjectionMatrix();
+
+    // 6. Drive OrbitControls' orbit point off the body center so auto-rotate
+    //    spins around the car, not above or below it.
+    setOrbitTarget([fittedCenter.x, fittedCenter.y, fittedCenter.z]);
+  }, [scene, camera, viewport.width, viewport.height]);
+
   useEffect(() => {
     if (swatch) applyBodyColor(scene, swatch);
   }, [scene, swatch]);
+
   return (
     <>
       <ambientLight intensity={0.8} />
       <directionalLight position={[5, 8, 5]} intensity={1.3} />
       <directionalLight position={[-5, 3, -3]} intensity={0.4} color="#88aaff" />
-      <primitive object={scene} scale={1.2} position={[0, -0.5, 0]} />
-      <OrbitControls autoRotate autoRotateSpeed={1.5} enableZoom={false} maxPolarAngle={Math.PI / 2} />
+      <primitive object={scene} />
+      <OrbitControls
+        autoRotate
+        autoRotateSpeed={1.5}
+        enableZoom
+        zoomSpeed={0.6}
+        minDistance={1.5}
+        maxDistance={30}
+        maxPolarAngle={Math.PI / 2}
+        target={orbitTarget}
+      />
       <Environment preset="city" />
     </>
   );
@@ -365,16 +501,260 @@ function FinancingEditor({ financing, pricing, onConfirmEdits, isReanalyzing }) 
   );
 }
 
-function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect }) {
+// ─── Car Images panel ────────────────────────────────────────────────────────
+// Shown when the "Car Images" tab is active. Combines:
+//   - userImages: data-URL-encoded photos the user uploaded for this analysis
+//   - vinAuditImages: stock photos pulled by VIN (currently stubbed; returns
+//                     [] until VinAudit API access lands)
+// Click any tile to open the lightbox.
+function CarImagesPanel({ userImages, vehicle }) {
+  const [vinImages, setVinImages] = useState([]);
+  const [loadingVin, setLoadingVin] = useState(false);
+  // Track the open tile by INDEX (not src) so ←/→ keys can navigate through
+  // the full list. null = lightbox closed.
+  const [lightboxIndex, setLightboxIndex] = useState(null);
+
+  useEffect(() => {
+    let abort = false;
+    const vin = vehicle?.vin;
+    if (!vin) return;
+    setLoadingVin(true);
+    fetchVinAuditImages(vin)
+      .then((imgs) => {
+        if (!abort) setVinImages(Array.isArray(imgs) ? imgs : []);
+      })
+      .finally(() => {
+        if (!abort) setLoadingVin(false);
+      });
+    return () => { abort = true; };
+  }, [vehicle?.vin]);
+
+  const tiles = useMemo(() => {
+    const out = [];
+    for (const img of userImages || []) {
+      if (img?.dataUrl) out.push({ src: img.dataUrl, label: img.name || 'Uploaded photo', source: 'user' });
+    }
+    for (const img of vinImages) {
+      if (img?.url) out.push({ src: img.url, label: 'VinAudit stock photo', source: 'vinaudit' });
+    }
+    return out;
+  }, [userImages, vinImages]);
+
+  // Keyboard navigation while the lightbox is open.
+  // Esc → close. ← / → → cycle. The handler is registered only when an
+  // index is selected so it doesn't intercept keys outside lightbox mode.
+  useEffect(() => {
+    if (lightboxIndex == null) return;
+    const handler = (e) => {
+      if (tiles.length === 0) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setLightboxIndex(null);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        setLightboxIndex((i) => (i == null ? 0 : (i + 1) % tiles.length));
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        setLightboxIndex((i) => (i == null ? 0 : (i - 1 + tiles.length) % tiles.length));
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [lightboxIndex, tiles.length]);
+
+  const empty = tiles.length === 0 && !loadingVin;
+
+  return (
+    <div className="absolute inset-0 overflow-y-auto" style={{ padding: 16, paddingBottom: 220 }}>
+      {empty ? (
+        <div className="h-full flex flex-col items-center justify-center text-center px-6" style={{ minHeight: '60%' }}>
+          <ImageIcon size={36} style={{ color: 'var(--color-muted)', opacity: 0.5 }} />
+          <div className="text-sm mt-3 font-semibold" style={{ color: 'var(--color-text)' }}>
+            No photos available
+          </div>
+          <div className="text-xs mt-1 max-w-xs" style={{ color: 'var(--color-muted)' }}>
+            Upload one or more vehicle photos with your CARFAX to see them here.
+            VinAudit stock photos will appear automatically once API access is provisioned.
+          </div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-2">
+          {tiles.map((t, i) => (
+            <button
+              key={i}
+              onClick={() => setLightboxIndex(i)}
+              title={t.label}
+              className="relative rounded-xl overflow-hidden transition-transform hover:scale-[1.02]"
+              style={{
+                aspectRatio: '4 / 3',
+                border: '1px solid var(--color-border)',
+                background: 'var(--color-bg)',
+                padding: 0,
+                cursor: 'zoom-in',
+              }}
+            >
+              <img
+                src={t.src}
+                alt={t.label}
+                style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+              />
+              {t.source === 'vinaudit' && (
+                <span
+                  className="absolute top-1.5 left-1.5 text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full"
+                  style={{ background: 'rgba(0,0,0,0.7)', color: '#fff' }}
+                >
+                  VinAudit
+                </span>
+              )}
+            </button>
+          ))}
+          {loadingVin && (
+            <div
+              className="rounded-xl flex items-center justify-center text-xs"
+              style={{
+                aspectRatio: '4 / 3',
+                border: '1px dashed var(--color-border)',
+                color: 'var(--color-muted)',
+              }}
+            >
+              Loading VinAudit photos…
+            </div>
+          )}
+        </div>
+      )}
+
+      {lightboxIndex != null && tiles[lightboxIndex] && (
+        <div
+          onClick={() => setLightboxIndex(null)}
+          className="fixed inset-0 z-[70] flex items-center justify-center cursor-zoom-out"
+          style={{ background: 'rgba(0,0,0,0.9)', backdropFilter: 'blur(8px)' }}
+        >
+          <img
+            src={tiles[lightboxIndex].src}
+            alt={tiles[lightboxIndex].label}
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: '92vw', maxHeight: '88vh', objectFit: 'contain', borderRadius: 12, cursor: 'default' }}
+          />
+          {/* Counter pill */}
+          {tiles.length > 1 && (
+            <div
+              className="absolute bottom-6 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-xs font-semibold"
+              style={{ background: 'rgba(255,255,255,0.15)', color: '#fff', backdropFilter: 'blur(8px)' }}
+            >
+              {lightboxIndex + 1} / {tiles.length}
+            </div>
+          )}
+          {/* Prev/Next arrows — only when there is more than one tile */}
+          {tiles.length > 1 && (
+            <>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setLightboxIndex((i) => (i - 1 + tiles.length) % tiles.length);
+                }}
+                aria-label="Previous image"
+                className="absolute left-6 top-1/2 -translate-y-1/2 w-11 h-11 rounded-full flex items-center justify-center text-2xl transition-all hover:scale-110"
+                style={{ background: 'rgba(255,255,255,0.15)', color: '#fff', border: 'none', cursor: 'pointer', backdropFilter: 'blur(8px)' }}
+              >
+                ‹
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setLightboxIndex((i) => (i + 1) % tiles.length);
+                }}
+                aria-label="Next image"
+                className="absolute right-6 top-1/2 -translate-y-1/2 w-11 h-11 rounded-full flex items-center justify-center text-2xl transition-all hover:scale-110"
+                style={{ background: 'rgba(255,255,255,0.15)', color: '#fff', border: 'none', cursor: 'pointer', backdropFilter: 'blur(8px)' }}
+              >
+                ›
+              </button>
+            </>
+          )}
+          <div
+            className="absolute top-6 right-6 text-xs font-medium px-2.5 py-1 rounded-full"
+            style={{ background: 'rgba(255,255,255,0.12)', color: '#fff', backdropFilter: 'blur(8px)' }}
+          >
+            ← → to navigate · Esc to close
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Tab strip ───────────────────────────────────────────────────────────────
+function ViewTabs({ active, onChange, modelStatus }) {
+  const generating = modelStatus
+    && modelStatus !== 'Done'
+    && modelStatus !== 'Failed'
+    && modelStatus !== 'CacheHit';
+  return (
+    <div
+      className="absolute top-3 left-3 right-3 flex items-center gap-1 p-1 rounded-full z-10"
+      style={{
+        background: 'var(--color-bg)',
+        border: '1px solid var(--color-border)',
+        backdropFilter: 'blur(10px)',
+      }}
+    >
+      {[
+        { id: 'images', label: 'Car Images', Icon: ImageIcon },
+        { id: 'model', label: '3D Model', Icon: Box },
+      ].map(({ id, label, Icon }) => {
+        const isActive = active === id;
+        return (
+          <button
+            key={id}
+            onClick={() => onChange(id)}
+            className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all"
+            style={{
+              background: isActive ? 'var(--color-accent)' : 'transparent',
+              color: isActive ? '#fff' : 'var(--color-muted)',
+            }}
+          >
+            <Icon size={12} />
+            {label}
+            {id === 'model' && generating && (
+              <span
+                className="ml-1 inline-block rounded-full"
+                style={{
+                  width: 6,
+                  height: 6,
+                  background: isActive ? '#fff' : '#2563eb',
+                  animation: 'pulse 1.5s ease-in-out infinite',
+                }}
+              />
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect, activeTab, userImages }) {
   const showGLB = !!glbUrl;
   const bodyStyle = inferBodyStyle(vehicle);
   const activeSwatch = BODY_COLORS.find(c => c.id === activeColorId) || null;
 
+  // Both panels are kept mounted; we toggle visibility via display rather
+  // than conditionally rendering. Mounting/unmounting the <Canvas> on every
+  // tab toggle creates a fresh WebGL context each time, and Chrome caps
+  // active contexts at ~8 — repeatedly toggling eventually triggers
+  // "THREE.WebGLRenderer: Context Lost" as the browser force-evicts old
+  // contexts. Keeping the Canvas mounted avoids this entirely.
   return (
-    <div style={{ position: 'absolute', inset: 0 }}>
+    <>
+      <div style={{ position: 'absolute', inset: 0, display: activeTab === 'images' ? 'block' : 'none' }}>
+        <CarImagesPanel userImages={userImages} vehicle={vehicle} />
+      </div>
+    <div style={{ position: 'absolute', inset: 0, display: activeTab === 'images' ? 'none' : 'block' }}>
       {showGLB ? (
-        // Tier 1 — AI-generated GLB from Tripo3D, persisted in R2 by trim
-        <Canvas camera={{ position: [3, 1.5, 4], fov: 45 }} style={{ background: 'transparent' }}>
+        // Tier 1 — AI-generated GLB from Tripo3D, persisted in R2 by trim.
+        // Position is computed dynamically inside GLBScene per-model; only
+        // the FOV survives across renders (the fit math depends on it).
+        <Canvas camera={{ fov: 38 }} style={{ background: 'transparent' }}>
           <GLBScene url={glbUrl} swatch={activeSwatch} />
         </Canvas>
       ) : (
@@ -391,38 +771,90 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
         <ColorSwatchRow activeId={activeColorId} onSelect={onColorSelect} />
       )}
 
-      {/* Hyper3D job status pill */}
-      {!showGLB && modelStatus && modelStatus !== 'Done' && modelStatus !== 'Failed' && (
-        <div
-          className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium model-loading"
-          style={{ background: 'var(--color-bg)', color: 'var(--color-text)', border: '1px solid var(--color-border)', backdropFilter: 'blur(8px)' }}
-        >
-          <Cpu size={11} />
-          {modelStatus === 'Pending' ? 'Queued for 3D…' : 'Rendering 3D model…'}
-        </div>
-      )}
-
-      {/* Pipeline badge */}
-      {!showGLB && (
-        <div
-          className="absolute top-4 left-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold"
-          style={{ background: 'var(--color-bg)', color: 'var(--color-muted)', backdropFilter: 'blur(10px)', border: '1px solid var(--color-border)' }}
-        >
-          <Cpu size={10} />
-          Pipeline 3D · Procedural
-        </div>
-      )}
+      {/* When the GLB is still being generated and the user is looking at the
+          3D Model tab, show a prominent centered "creating" message with the
+          pulsing dots — much more visible than the small top-left pill. The
+          procedural fallback continues to spin behind it.
+          We treat ANY non-terminal state (including null, which happens during
+          the gap between the report streaming and startRodinJob's first
+          progress callback) as "still generating" so the user always sees the
+          message immediately when they switch to the 3D Model tab. */}
+      {!showGLB && (() => {
+        const isTerminal =
+          modelStatus === 'Done' || modelStatus === 'Failed' || modelStatus === 'CacheHit';
+        const generating = !isTerminal;
+        if (generating) {
+          const label =
+            modelStatus === 'Pending' ? 'Queued for 3D…' :
+            modelStatus === 'WaitingForOther' ? 'Waiting on another generation…' :
+            'Generating 3D model…';
+          return (
+            <>
+              <div
+                className="absolute inset-x-0 flex items-center justify-center pointer-events-none"
+                style={{ bottom: '50%', transform: 'translateY(50%)' }}
+              >
+                <div
+                  className="flex flex-col items-center gap-3 px-6 py-5 rounded-2xl text-center"
+                  style={{
+                    background: 'var(--color-surface)',
+                    border: '1px solid var(--color-border)',
+                    backdropFilter: 'blur(12px)',
+                    boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+                    minWidth: 240,
+                    animation: 'pulse 2.4s ease-in-out infinite',
+                  }}
+                >
+                  <Cpu size={26} style={{ color: 'var(--color-accent)' }} className="animate-pulse" />
+                  <div className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+                    3D model in creation
+                  </div>
+                  <div className="text-xs" style={{ color: 'var(--color-muted)', maxWidth: 220 }}>
+                    Can take up to 2 minutes — please wait. Status: {label}
+                  </div>
+                  <span className="flex items-center gap-1.5 mt-1">
+                    <span className="typing-dot" />
+                    <span className="typing-dot" />
+                    <span className="typing-dot" />
+                  </span>
+                </div>
+              </div>
+              <div
+                className="absolute top-16 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium model-loading"
+                style={{ background: 'var(--color-bg)', color: 'var(--color-text)', border: '1px solid var(--color-border)', backdropFilter: 'blur(8px)' }}
+              >
+                <Cpu size={11} className="animate-pulse" />
+                {label}
+              </div>
+            </>
+          );
+        }
+        return (
+          <div
+            className="absolute top-16 left-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold"
+            style={{ background: 'var(--color-bg)', color: 'var(--color-muted)', backdropFilter: 'blur(10px)', border: '1px solid var(--color-border)' }}
+          >
+            <Cpu size={10} />
+            Pipeline 3D · Procedural
+          </div>
+        );
+      })()}
     </div>
+    </>
   );
 }
 
-export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, onClose, onConfirmEdits, isReanalyzing }) {
+export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, userImages = [], onClose, onConfirmEdits, isReanalyzing }) {
   const [exiting, setExiting] = useState(false);
   const closeTimer = useRef(null);
   // Color picker state. Seeded from the CARFAX/decoded color when possible so
   // the GLB opens with a tint that matches the actual car; user can override.
   const inferredColorId = inferColorIdFromVehicle(report?.vehicle);
   const [activeColorId, setActiveColorId] = useState(inferredColorId || 'white');
+  // Tab state — defaults to "Car Images" so the user sees real photos
+  // immediately while the 3D model is still rendering. Toggle to "3D Model"
+  // shows the GLB or the in-progress message.
+  const [activeTab, setActiveTab] = useState('images');
 
   const handleClose = () => {
     setExiting(true);
@@ -456,6 +888,8 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
           className="relative flex-shrink-0 overflow-hidden"
           style={{ width: '42%', background: 'var(--color-surface)', borderRight: '1px solid var(--color-border)' }}
         >
+          <ViewTabs active={activeTab} onChange={setActiveTab} modelStatus={modelStatus} />
+
           <LeftPanel
             vehicleColor={vehicleColor}
             glbUrl={glbUrl}
@@ -464,6 +898,8 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
             wheelColor="gunmetal"
             activeColorId={activeColorId}
             onColorSelect={setActiveColorId}
+            activeTab={activeTab}
+            userImages={userImages}
           />
 
           {/* Bottom gradient + info — theme-aware fade so text stays legible */}

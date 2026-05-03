@@ -1,0 +1,52 @@
+rules_version = '2';
+
+// Firebase Storage rules for VinCritiq (Blaze plan).
+//
+// HOW TO APPLY:
+//   1. Open the Firebase Console → Storage → Rules tab.
+//   2. Paste the contents below into the editor.
+//   3. Click "Publish".
+//
+// (Or via CLI: `firebase deploy --only storage` after wiring `firebase.json`.)
+//
+// Layout enforced by these rules:
+//   users/{uid}/sessions/{sid}/vehicle-{ts}-{i}-{name}   ← MessageBubble photos
+//   users/{uid}/...                                       ← future per-user assets
+//   public/...                                            ← world-readable shared assets
+//
+// Server-side hard caps (defense-in-depth on top of compressImageFile):
+//   - Each upload ≤ 4 MiB.
+//   - Each upload must be image/* (we only intend to store photos here).
+//   - Anonymous reads/writes denied everywhere.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ─── Per-user namespace ────────────────────────────────────────────────
+    // The owning user can read & write their own files. Writes must be
+    // images and ≤ 4 MiB each — even with client-side compression we still
+    // want a ceiling so a misbehaving client can't burn storage on us.
+    match /users/{uid}/{allPaths=**} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow write: if request.auth != null
+                   && request.auth.uid == uid
+                   && (request.resource == null
+                       || (request.resource.size < 4 * 1024 * 1024
+                           && request.resource.contentType.matches('image/.*')));
+    }
+
+    // ─── Public namespace (reserved) ───────────────────────────────────────
+    // World-readable, authenticated-write. Same 4 MiB image-only cap.
+    match /public/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.resource.size < 4 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // ─── Default deny ──────────────────────────────────────────────────────
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

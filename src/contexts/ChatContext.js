@@ -98,20 +98,37 @@ export function ChatProvider({ children }) {
   // Drops: isStreaming (transient), steps (transient UI), _img64/_imgMt (too large for Firestore 1MB doc limit).
   // Keeps: _carfaxText (usually <50KB, needed for regenerate) and report (needed to re-open modal from history).
   const sanitizeForFirestore = (message) => {
-    const { isStreaming, steps, _img64, _imgMt, ...rest } = message;
     const clean = {};
-    for (const [k, v] of Object.entries(rest)) {
-      if (v !== undefined) clean[k] = v;
+    for (const [k, v] of Object.entries(message)) {
+      if (v === undefined) continue;
+      // Drop transient UI state and any underscore-prefixed in-session-only field
+      // (e.g. _img64, _imgMt, _imgs64, _attachments, _vehicleColor, _carfaxText).
+      // These are too large for Firestore (image bytes) or simply not needed in
+      // history. _vehicleColor is small but not worth round-tripping.
+      if (k === 'isStreaming' || k === 'steps') continue;
+      if (k.startsWith('_')) {
+        // Whitelist a handful of underscore fields that ARE useful in history
+        if (k === '_vehicleColor') {
+          clean[k] = v;
+          continue;
+        }
+        continue;
+      }
+      clean[k] = v;
     }
     return clean;
   };
 
+  // Returns the new Firestore doc ID for non-streaming, signed-in writes.
+  // Returns null for streaming placeholders, anonymous sessions, local-only
+  // sessions, or if the write fails. Callers use the ID to later patch
+  // additional fields onto the message (e.g. imageUrl after a Storage upload).
   const addMessage = useCallback(async (sessionId, message) => {
     const optimistic = { ...message, id: Date.now().toString() };
     setMessages(prev => [...prev, optimistic]);
 
     // Never persist streaming placeholders — they'll be saved when streaming ends
-    if (message.isStreaming) return;
+    if (message.isStreaming) return null;
 
     if (user && sessionId && !sessionId.startsWith('local-')) {
       try {
@@ -124,10 +141,12 @@ export function ChatProvider({ children }) {
           ...(message.role === 'user' && message.text ? { title: message.text.slice(0, 50) } : {}),
         });
         setMessages(prev => prev.map(m => m.id === optimistic.id ? { ...m, id: ref.id } : m));
+        return ref.id;
       } catch (err) {
         console.error('addMessage: Firestore write failed', err);
       }
     }
+    return null;
   }, [user]);
 
   // Called after streaming completes to persist the final assistant message.

@@ -3,8 +3,9 @@
 // control sum required by the 3.2 API. Returns a normalized JSON payload
 // the client can consume without knowing the raw Vincario schema.
 //
-// If keys aren't configured, returns 501 so the client can fall back to
-// NHTSA vPIC.
+// If keys aren't configured, returns 200 with { available: false } so the
+// browser doesn't log a red error and the client falls back to NHTSA vPIC.
+// NHTSA is the primary, always-free decoder; Vincario is an optional upgrade.
 
 export async function onRequestGet({ request, env }) {
   const url = new URL(request.url);
@@ -13,7 +14,7 @@ export async function onRequestGet({ request, env }) {
     return json({ error: 'valid 17-char vin required' }, 400);
   }
   if (!env.VINCARIO_KEY || !env.VINCARIO_SECRET) {
-    return json({ error: 'vincario_not_configured' }, 501);
+    return json({ available: false, reason: 'vincario_not_configured' }, 200);
   }
 
   // 3.2 API: control-sum = first 10 hex chars of SHA1(vin + action + key + secret)

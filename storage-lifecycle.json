@@ -1,0 +1,20 @@
+{
+  "_comment": "GCS lifecycle config for the Firebase Storage bucket. See README in this directory for instructions.",
+  "lifecycle": {
+    "rule": [
+      {
+        "_comment": "Delete user-uploaded vehicle photos older than 90 days. Reports are still retrievable from Firestore and re-fetch via VinAudit / regeneration if the user opens an old chat after expiry.",
+        "action": { "type": "Delete" },
+        "condition": {
+          "age": 90,
+          "matchesPrefix": [ "users/" ]
+        }
+      },
+      {
+        "_comment": "Aborts orphaned multipart uploads that never completed (rare but they can accumulate cost).",
+        "action": { "type": "AbortIncompleteMultipartUpload" },
+        "condition": { "age": 1 }
+      }
+    ]
+  }
+}

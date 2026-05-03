@@ -4,12 +4,38 @@
 // but falls back to the legacy REACT_APP_*_API_KEY names so existing .env works).
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const crypto = require('crypto');
+const { Readable } = require('node:stream');
 
-const CLAUDE_KEY      = process.env.CLAUDE_API_KEY   || process.env.REACT_APP_CLAUDE_API_KEY;
-const TRIPO_KEY       = process.env.TRIPO_KEY        || process.env.REACT_APP_TRIPO_API_KEY;
-const VINAUDIT_KEY    = process.env.VINAUDIT_KEY     || process.env.REACT_APP_VINAUDIT_API_KEY;
-const VINCARIO_KEY    = process.env.VINCARIO_KEY;
-const VINCARIO_SECRET = process.env.VINCARIO_SECRET;
+// Accept multiple env-var spellings so production (Cloudflare Pages bindings)
+// and local .env can use whichever convention. The first non-empty wins.
+const pickEnv = (...names) => {
+  for (const n of names) {
+    const v = process.env[n];
+    if (v && String(v).trim() !== '') return v.trim();
+  }
+  return undefined;
+};
+const CLAUDE_KEY      = pickEnv('CLAUDE_API_KEY', 'CLAUDE_KEY', 'REACT_APP_CLAUDE_API_KEY');
+const TRIPO_KEY       = pickEnv('TRIPO_KEY', 'TRIPO_API_KEY', 'REACT_APP_TRIPO_API_KEY');
+const VINAUDIT_KEY    = pickEnv('VINAUDIT_KEY', 'VINAUDIT_API_KEY', 'REACT_APP_VINAUDIT_API_KEY');
+const VINCARIO_KEY    = pickEnv('VINCARIO_KEY');
+const VINCARIO_SECRET = pickEnv('VINCARIO_SECRET');
+
+// Startup banner — confirms which keys actually loaded into this process.
+// Prints first/last 4 chars + length so you can eyeball it without leaking
+// the secret. If a key shows "MISSING", the dev server didn't see it in
+// .env at start time; restart `npm start` after editing .env.
+const fingerprint = (k) => {
+  if (!k) return 'MISSING';
+  const s = String(k).trim();
+  return `${s.slice(0, 4)}…${s.slice(-4)} (len ${s.length})`;
+};
+console.log('[setupProxy] keys loaded:');
+console.log('  CLAUDE_KEY     :', fingerprint(CLAUDE_KEY));
+console.log('  TRIPO_KEY      :', fingerprint(TRIPO_KEY));
+console.log('  VINAUDIT_KEY   :', fingerprint(VINAUDIT_KEY));
+console.log('  VINCARIO_KEY   :', fingerprint(VINCARIO_KEY));
+console.log('  VINCARIO_SECRET:', fingerprint(VINCARIO_SECRET));
 
 const stripBrowserHeaders = (proxyReq) => {
   proxyReq.removeHeader('origin');
@@ -21,7 +47,11 @@ const stripBrowserHeaders = (proxyReq) => {
 };
 
 module.exports = function (app) {
-  // Claude (Anthropic Messages) — server adds x-api-key & anthropic-version
+  // Claude (Anthropic Messages) — server adds x-api-key & anthropic-version.
+  // We capture and log the upstream body for any non-2xx response so we can
+  // tell apart 400 (oversized image / bad payload), 401 (bad key), 413
+  // (request too large), 529 (overloaded), etc. The successful streaming
+  // path is left completely untouched.
   app.use(
     '/api/claude',
     createProxyMiddleware({
@@ -33,6 +63,16 @@ module.exports = function (app) {
         if (CLAUDE_KEY) proxyReq.setHeader('x-api-key', CLAUDE_KEY);
         proxyReq.setHeader('anthropic-version', '2023-06-01');
       },
+      onProxyRes: (proxyRes, req) => {
+        if (proxyRes.statusCode >= 400) {
+          const chunks = [];
+          proxyRes.on('data', (c) => chunks.push(c));
+          proxyRes.on('end', () => {
+            const body = Buffer.concat(chunks).toString('utf8').slice(0, 600);
+            console.warn(`[claude←] ${req.method} ${req.url}  status: ${proxyRes.statusCode}\n         body: ${body}`);
+          });
+        }
+      },
     })
   );
 
@@ -43,9 +83,26 @@ module.exports = function (app) {
       target: 'https://api.tripo3d.ai',
       changeOrigin: true,
       pathRewrite: { '^/api/tripo': '/v2/openapi' },
-      onProxyReq: (proxyReq) => {
+      onProxyReq: (proxyReq, req) => {
         stripBrowserHeaders(proxyReq);
-        if (TRIPO_KEY) proxyReq.setHeader('Authorization', `Bearer ${TRIPO_KEY}`);
+        if (TRIPO_KEY) {
+          proxyReq.setHeader('Authorization', `Bearer ${TRIPO_KEY}`);
+          console.log(`[tripo→] ${req.method} ${req.url}  auth: attached (key ${fingerprint(TRIPO_KEY)})`);
+        } else {
+          console.warn(`[tripo→] ${req.method} ${req.url}  auth: MISSING — TRIPO_KEY not loaded; request will 401`);
+        }
+      },
+      onProxyRes: (proxyRes, req) => {
+        if (proxyRes.statusCode >= 400) {
+          // Surface the upstream body for failed Tripo requests so we can tell
+          // 401 (bad key) from 402 (out of credits) from 400 (bad payload).
+          const chunks = [];
+          proxyRes.on('data', (c) => chunks.push(c));
+          proxyRes.on('end', () => {
+            const body = Buffer.concat(chunks).toString('utf8').slice(0, 400);
+            console.warn(`[tripo←] ${req.method} ${req.url}  status: ${proxyRes.statusCode}\n         body: ${body}`);
+          });
+        }
       },
     })
   );
@@ -58,7 +115,11 @@ module.exports = function (app) {
       return res.status(400).json({ error: 'valid 17-char vin required' });
     }
     if (!VINCARIO_KEY || !VINCARIO_SECRET) {
-      return res.status(501).json({ error: 'vincario_not_configured' });
+      // Return 200 (not 501) so the browser doesn't log a red error in the
+      // console. The decoder reads `available: false` and gracefully falls
+      // back to NHTSA. Vincario is an optional upgrade — NHTSA is the
+      // primary path and is always free.
+      return res.json({ available: false, reason: 'vincario_not_configured' });
     }
     try {
       const action = 'decode';
@@ -125,6 +186,42 @@ module.exports = function (app) {
 
   app.get('/api/models/upload', (_req, res) => {
     res.json({ exists: false, reason: 'dev_no_bucket' });
+  });
+
+  // Dev-only GLB CORS bypass.
+  //
+  // Tripo3D's CDN (tripo-data.rg1.data.tripo3d.com) doesn't send
+  // Access-Control-Allow-Origin, so a browser fetch from localhost is
+  // blocked. In production this never happens — R2 + our custom domain
+  // (models.vincritiq.com) has CORS configured. In dev we tunnel the
+  // request through the dev server so the browser sees a same-origin
+  // response with permissive CORS headers.
+  //
+  // Only Tripo CDN hosts are allow-listed here so this can't be turned
+  // into an SSRF that pulls arbitrary URLs.
+  app.get('/dev-glb-proxy', async (req, res) => {
+    const url = String(req.query.url || '');
+    if (!/^https:\/\/[a-z0-9-]+\.(?:rg1\.)?data\.tripo3d\.com\//i.test(url)) {
+      return res.status(400).json({ error: 'invalid_or_disallowed_url' });
+    }
+    try {
+      const upstream = await fetch(url);
+      if (!upstream.ok) {
+        console.warn('[dev-glb-proxy] upstream non-OK', { status: upstream.status, url });
+        return res.status(upstream.status).end();
+      }
+      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'model/gltf-binary');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      if (upstream.body) {
+        Readable.fromWeb(upstream.body).pipe(res);
+      } else {
+        res.end();
+      }
+    } catch (err) {
+      console.warn('[dev-glb-proxy] fetch threw', err);
+      res.status(502).json({ error: 'upstream_failed', message: String(err?.message || err) });
+    }
   });
 
   // VinAudit — server injects key into query string
