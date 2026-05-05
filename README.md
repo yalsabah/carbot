@@ -1,70 +1,157 @@
-# Getting Started with Create React App
+# VinCritiq
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+> AI-powered used-car deal analyzer. Upload a CARFAX PDF and a few photos of a vehicle, and VinCritiq returns a structured deal report — pricing vs. market, depreciation curve, financing math, vehicle history flags, an interactive 3D model, and a Great / Good / Fair / Bad verdict.
 
-## Available Scripts
+🌐 **Live site:** [vincritiq.com](https://vincritiq.com)
 
-In the project directory, you can run:
+---
 
-### `npm start`
+## What it does
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+- **CARFAX + photo analysis** — parse the report, classify title status, accident count, owner history, and service health.
+- **Pricing intelligence** — compare against KBB and market averages; surface % over/under and a structured price story.
+- **Financing math** — APR, term, down payment, monthly payment, total interest, total cost.
+- **Depreciation curve** — projected 1/3/5-year residual values for the specific year/make/model.
+- **Verdict engine** — heavy-flag rules (salvage, frame damage, 4+ owners, etc.) hard-cap the rating; price drives the base case otherwise.
+- **Interactive 3D model** — generated once per year/make/model/trim from a vehicle photo via Tripo3D, cached in Cloudflare R2, then re-served instantly to every future user querying the same vehicle.
+- **Body-color swatches** — repaint the 3D model in 8 preset colors via shader-injected per-pixel re-hueing.
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+## Stack
 
-### `npm test`
+- **Frontend:** React 18 (CRA), Tailwind, Three.js / @react-three/fiber / @react-three/drei
+- **Backend:** Cloudflare Pages Functions (`/functions/api/*`)
+- **Storage:** Cloudflare R2 (3D model cache), Firebase Storage (vehicle photos)
+- **Database & Auth:** Firebase Firestore + Firebase Auth
+- **AI:** Anthropic Claude Sonnet (streaming, multimodal, prompt caching)
+- **3D pipeline:** Tripo3D image-to-model API → R2 mirror for permanent URLs
+- **Hosting:** Cloudflare Pages
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+---
 
-### `npm run build`
+## Run it locally
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+### 1. Prerequisites
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+- Node.js **18+** and npm
+- Git
+- A Firebase project (free Spark plan is fine for local dev; Blaze required for Storage)
+- API keys for: **Anthropic Claude**, **Tripo3D**, optionally **VinAudit** and **Vincario** (VIN decode)
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+### 2. Clone and install
 
-### `npm run eject`
+```bash
+git clone https://github.com/<your-org>/vincritiq.git
+cd vincritiq/carbot
+npm install
+```
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+### 3. Configure environment variables
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+Create `carbot/.env` (this file is gitignored). The dev proxy in `src/setupProxy.js` reads server-side secrets from this file and proxies them to the real upstream APIs so the browser never sees them.
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+```bash
+# ── Server-side secrets (used by the dev proxy in src/setupProxy.js) ──
+CLAUDE_API_KEY=sk-ant-…
+TRIPO_KEY=tsk_…
+VINAUDIT_KEY=…           # optional — VIN-image lookups
+VINCARIO_KEY=…           # optional — VIN decode
+VINCARIO_SECRET=…        # optional — VIN decode
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
+# ── Public Firebase web config (baked into the client bundle) ──
+REACT_APP_FIREBASE_API_KEY=…
+REACT_APP_FIREBASE_AUTH_DOMAIN=your-project.firebaseapp.com
+REACT_APP_FIREBASE_PROJECT_ID=your-project
+REACT_APP_FIREBASE_STORAGE_BUCKET=your-project.firebasestorage.app
+REACT_APP_FIREBASE_MESSAGING_SENDER_ID=…
+REACT_APP_FIREBASE_APP_ID=1:…:web:…
+REACT_APP_FIREBASE_MEASUREMENT_ID=G-…
+```
 
-## Learn More
+> Get the Firebase web config from **Firebase Console → Project Settings → General → Your apps → Web app → SDK setup**.
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+### 4. Set up Firebase
 
-To learn React, check out the [React documentation](https://reactjs.org/).
+In the [Firebase Console](https://console.firebase.google.com/):
 
-### Code Splitting
+1. **Authentication** → enable **Email/Password** and **Google** sign-in.
+2. **Firestore Database** → create in production mode, then publish these rules (Rules tab):
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
+   ```javascript
+   rules_version = '2';
+   service cloud.firestore {
+     match /databases/{database}/documents {
+       // Cross-user 3D model cache — slug-keyed, no per-user ownership.
+       match /models3d/{slug} {
+         allow read, create, update: if request.auth != null;
+       }
 
-### Analyzing the Bundle Size
+       // Per-user chat sessions, messages, settings.
+       match /users/{uid}/{document=**} {
+         allow read, write: if request.auth != null && request.auth.uid == uid;
+       }
+     }
+   }
+   ```
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
+3. **Storage** (requires Blaze plan) → publish [`storage.rules`](./storage.rules) from this repo.
+4. (Optional) **Storage lifecycle** → apply [`storage-lifecycle.json`](./storage-lifecycle.json) via `gsutil` to auto-delete user uploads after 90 days.
 
-### Making a Progressive Web App
+### 5. Start the dev server
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
+```bash
+npm start
+```
 
-### Advanced Configuration
+Opens [http://localhost:3000](http://localhost:3000). The dev proxy starts automatically and prints a startup banner showing which API keys it loaded — if a key shows `MISSING`, double-check `.env` and restart.
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
+### 6. (Optional) Deploy your own copy
 
-### Deployment
+This project deploys to Cloudflare Pages with a connected R2 bucket. Push to your fork, then in the Cloudflare dashboard:
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
+1. Pages → Create project → connect your repo, build command `npm run build`, output `build/`.
+2. Settings → Environment variables → add the **server-side secrets** as encrypted Secrets (`CLAUDE_API_KEY`, `TRIPO_KEY`, etc.). The Firebase `REACT_APP_*` values are already in [`wrangler.toml`](./wrangler.toml).
+3. R2 → create a bucket named `vincritiq-models`. The binding is declared in `wrangler.toml`.
+4. Settings → Custom domains → point your domain at the Pages project.
 
-### `npm run build` fails to minify
+---
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+## Available scripts
+
+| Script | What it does |
+|---|---|
+| `npm start` | Run dev server with proxy on `localhost:3000` |
+| `npm run build` | Production build into `build/` |
+| `npm test` | CRA test runner (interactive watch) |
+
+## Project layout
+
+```
+carbot/
+├── src/
+│   ├── components/      # ChatInterface, ReportModal, RightSidebar, …
+│   ├── contexts/        # Auth + Chat React contexts
+│   ├── utils/           # claudeApi, model3d, pricing, pdfParser, …
+│   └── setupProxy.js    # Dev-only API key proxy
+├── functions/api/       # Cloudflare Pages Functions (production proxy)
+│   ├── claude.js
+│   ├── models/upload.js # Tripo → R2 mirror
+│   ├── tripo/[[path]].js
+│   └── vinaudit.js
+├── public/
+├── storage.rules        # Firebase Storage rules
+├── storage-lifecycle.json
+├── wrangler.toml        # Cloudflare Pages config + R2 binding
+└── tailwind.config.js
+```
+
+## Troubleshooting
+
+- **`auth/invalid-api-key` on load** — `REACT_APP_FIREBASE_API_KEY` missing/wrong; restart `npm start` after editing `.env`.
+- **`/api/claude` 500** — Claude key missing in `.env` or hit the per-request size limit (the app compresses photos but very large CARFAX PDFs can still tip it).
+- **3D model stuck "pending"** — likely Firestore rules don't allow `update` on `models3d/{slug}`. Re-publish the rules above.
+- **CORS errors loading GLB** — in dev the Tripo URL is routed through `/dev-glb-proxy`; in prod the GLB must be served from R2 (`MODELS_PUBLIC_BASE` env var must be set in the Cloudflare dashboard).
+- **"Client is offline" warning on first load** — benign. Firestore's WebChannel is still connecting; the code retries automatically.
+
+## License
+
+Private project — all rights reserved.
