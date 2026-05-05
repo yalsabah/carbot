@@ -1,5 +1,6 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { AuthProvider } from './contexts/AuthContext';
+import { recoverPendingJobs } from './utils/model3d';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ChatProvider, useChat } from './contexts/ChatContext';
 import Sidebar from './components/Sidebar';
@@ -23,6 +24,13 @@ function AppInner() {
   // sidebar's "Compact Chat" button can invoke the same code path as typing
   // /compact in the input.
   const compactTriggerRef = useRef(null);
+
+  // On boot, recover any Tripo 3D jobs that were in-flight when the user
+  // refreshed/closed the tab. This polls each saved task_id and persists
+  // the result so we never waste a paid-for Tripo generation.
+  useEffect(() => {
+    recoverPendingJobs().catch(() => {});
+  }, []);
 
   return (
     <div className="flex h-screen overflow-hidden" style={{ background: 'var(--color-bg)' }}>

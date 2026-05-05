@@ -87,15 +87,21 @@ function inferColorIdFromVehicle(vehicle) {
 // Tripo3D returns a single merged mesh with one material — there are no
 // "body" vs "wheel" submeshes to look up by name. So instead of trying to
 // detect parts via mesh names (which always finds nothing), we tint per
-// PIXEL via shader injection:
+// PIXEL via shader injection.
 //
-//   - High saturation (taillights, badges, painted emblems) → preserve
-//   - Very low luminance (tires, rubber, dark grilles)      → preserve
-//   - Mid-saturation, mid-luminance (body paint)            → tint
+// Tripo bakes lighting/highlights/shadows into albedo, which means body
+// paint pixels often have substantial saturation (not pure grayscale).
+// Gating on low-saturation excludes most of the body. Instead we exclude
+// only the things that obviously shouldn't repaint:
 //
-// The result: rims, glass, lights, and trim keep their original look while
-// the body color responds to the swatch picker. The mask is computed against
-// the texture's albedo, so it works regardless of how the GLB is structured.
+//   - Pure-hue accents (taillight red, indicator amber)  → very high sat
+//   - Tires / rubber / dark cavities                      → very low lum
+//   - Chrome / headlight covers / specular hot spots      → very high lum
+//
+// Everything in between is treated as body paint and re-hued. The blend
+// REPLACES the hue with the swatch and reuses the original luminance for
+// shading — so a black car going to red still looks red (not black-times-
+// red ≈ black) but keeps panel highlights and crease shadows.
 function buildBodyTintCompiler(swatch) {
   const tintColor = new THREE.Color(swatch.hex);
   return (shader) => {
@@ -113,14 +119,25 @@ function buildBodyTintCompiler(swatch) {
           vec3 _albedo = diffuseColor.rgb;
           float _maxC = max(max(_albedo.r, _albedo.g), _albedo.b);
           float _minC = min(min(_albedo.r, _albedo.g), _albedo.b);
-          // Saturation in [0, 1]; near-zero means grayscale (paint candidate).
           float _sat = (_maxC > 0.001) ? (_maxC - _minC) / _maxC : 0.0;
-          // Luminance in [0, 1]; very low = tire/rubber, exclude.
-          float _lum = (_maxC + _minC) * 0.5;
-          float _satMask = 1.0 - smoothstep(0.18, 0.45, _sat);
-          float _lumMask = smoothstep(0.06, 0.22, _lum);
-          float _mask = _satMask * _lumMask;
-          diffuseColor.rgb = mix(_albedo, _albedo * uBodyTint, _mask);
+          float _lum = dot(_albedo, vec3(0.299, 0.587, 0.114));
+
+          // Exclude pure-hue accent lights/badges — body paint with baked
+          // lighting tops out around sat 0.7, taillight red is ~0.95+.
+          float _isAccent = smoothstep(0.78, 0.92, _sat);
+          // Exclude tires, rubber, dark grille cavities.
+          float _isDark   = 1.0 - smoothstep(0.03, 0.10, _lum);
+          // Exclude specular highlights, chrome, headlight covers.
+          float _isBright = smoothstep(0.88, 0.98, _lum);
+
+          float _mask = (1.0 - _isAccent) * (1.0 - _isDark) * (1.0 - _isBright);
+
+          // Re-hue: project luminance onto the swatch, then bias up so a
+          // dark base doesn't crush the new color into near-black. The
+          // 0.18..0.95 floor/ceiling preserves shading without flattening.
+          float _shading = clamp(_lum * 1.4 + 0.18, 0.18, 0.95);
+          vec3 _retinted = uBodyTint * _shading;
+          diffuseColor.rgb = mix(_albedo, _retinted, _mask);
         }`
       );
   };

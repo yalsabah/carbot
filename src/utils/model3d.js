@@ -62,6 +62,15 @@ function maybeProxyForDev(url) {
   return `/dev-glb-proxy?url=${encodeURIComponent(url)}`;
 }
 
+// Exported alias so callers outside this module (e.g. ChatInterface) can
+// route a stored Tripo URL through the dev-only CORS-bypass proxy when
+// reading it back from Firestore. Production builds short-circuit and
+// return the URL unchanged, so this is safe to call unconditionally.
+export const proxyForDevIfNeeded = maybeProxyForDev;
+export function isTripoCdnUrl(url) {
+  return typeof url === 'string' && TRIPO_CDN_RE.test(url);
+}
+
 // ─── Slug builder ─────────────────────────────────────────────────────────────
 // Two cars sharing year/make/model/trim share a slug. Trim is optional — many
 // VINs decode without one, in which case we drop it from the slug.
@@ -224,11 +233,22 @@ export async function wait3DModel(taskId, onProgress, signal) {
 // Tripo3D's CDN serves GLBs as AWS CloudFront signed URLs that expire after
 // ~24 hours. We must NEVER trust one as a permanent cache entry — even if
 // Firestore says status='ready', a Tripo URL that's a day old will 403.
-// In production, persistGlbToR2 rewrites the URL to our R2 origin, which
-// doesn't expire. In dev, the lack of R2 means stuck Tripo URLs can pollute
-// Firestore. This predicate skips them defensively at every read site.
-function isExpiringTripoUrl(url) {
-  return typeof url === 'string' && TRIPO_CDN_RE.test(url);
+//
+// Two policies:
+//   - PRODUCTION: persistGlbToR2 rewrites to R2, so a Tripo URL appearing on
+//     a 'ready' doc means R2 is misconfigured. Reject it on read so the
+//     procedural placeholder shows (no broken-modal). The slug re-claims and
+//     re-runs Tripo, but at least nothing 403s in the user's face.
+//   - DEV: no R2 binding, so Tripo URLs are the only thing we can cache.
+//     Persist them with `glbUrlExpiresAt` (22h out) and accept them on read
+//     until that timestamp passes. After expiry the doc gets re-claimed.
+function isUsableCachedDoc(data) {
+  if (!data || data.status !== 'ready' || !data.glbUrl) return false;
+  if (!isTripoCdnUrl(data.glbUrl)) return true;   // R2 / other — always fine
+  // From here on it IS a Tripo URL
+  if (process.env.NODE_ENV === 'production') return false;
+  const expiresAt = typeof data.glbUrlExpiresAt === 'number' ? data.glbUrlExpiresAt : 0;
+  return Date.now() < expiresAt;
 }
 
 // Passive cache lookup — read-only, no claim, no generation. Use this when
@@ -239,27 +259,55 @@ function isExpiringTripoUrl(url) {
 export async function lookupCachedModel(vehicle) {
   const slug = buildModelSlug(vehicle);
   if (!slug) return null;
+  const ref = doc(db, 'models3d', slug);
+
+  // Firestore's WebChannel sometimes isn't connected the instant this fires
+  // (page just loaded / auth just finished). The SDK then throws
+  // code:'unavailable' "client is offline" — a transient state, not a real
+  // network failure. One quick retry usually clears it; if it doesn't, we
+  // fall through to attemptClaim's transaction, which forces a connection
+  // and recovers on its own.
+  const readOnce = () => getDoc(ref);
+  let snap;
   try {
-    const snap = await getDoc(doc(db, 'models3d', slug));
-    if (!snap.exists()) {
-      dlog('lookupCachedModel: no doc for slug', slug);
-      return null;
-    }
-    const data = snap.data();
-    if (data.status !== 'ready' || !data.glbUrl) {
-      dlog('lookupCachedModel: doc not ready', { slug, status: data.status });
-      return null;
-    }
-    if (isExpiringTripoUrl(data.glbUrl)) {
-      dlog('lookupCachedModel: ignoring expiring Tripo URL — re-generation required', slug);
-      return null;
-    }
-    dlog('lookupCachedModel: cache hit', { slug });
-    return { glbUrl: maybeProxyForDev(data.glbUrl), slug, fromCache: true };
+    snap = await readOnce();
   } catch (err) {
-    dwarn('lookupCachedModel: read failed', err);
+    if (err?.code === 'unavailable') {
+      dlog('lookupCachedModel: transient offline, retrying once', { slug });
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        snap = await readOnce();
+      } catch (err2) {
+        if (err2?.code === 'unavailable') {
+          dlog('lookupCachedModel: still offline after retry — falling through to claim', { slug });
+          return null;
+        }
+        dwarn('lookupCachedModel: read failed (after retry)', err2);
+        return null;
+      }
+    } else {
+      dwarn('lookupCachedModel: read failed', err);
+      return null;
+    }
+  }
+
+  if (!snap.exists()) {
+    dlog('lookupCachedModel: no doc for slug', slug);
     return null;
   }
+  const data = snap.data();
+  if (!isUsableCachedDoc(data)) {
+    dlog('lookupCachedModel: doc not usable', {
+      slug,
+      status: data.status,
+      hasUrl: !!data.glbUrl,
+      isTripo: isTripoCdnUrl(data.glbUrl),
+      expiresAt: data.glbUrlExpiresAt,
+    });
+    return null;
+  }
+  dlog('lookupCachedModel: cache hit', { slug });
+  return { glbUrl: maybeProxyForDev(data.glbUrl), slug, fromCache: true };
 }
 
 async function attemptClaim(slug, vehicle) {
@@ -269,14 +317,13 @@ async function attemptClaim(slug, vehicle) {
     if (snap.exists()) {
       const data = snap.data();
       if (data.status === 'ready' && data.glbUrl) {
-        // Skip ready entries whose URL points at Tripo's CDN — those are
-        // signed CloudFront URLs that expire after ~24h and would 403 the
-        // modal. Pretend it's a stale claim so we re-generate cleanly.
-        if (isExpiringTripoUrl(data.glbUrl)) {
-          dlog('attemptClaim: ignoring expired Tripo URL on ready doc, re-claiming', slug);
-        } else {
+        // In prod, never trust a stored Tripo URL — those CloudFront
+        // signatures expire ~24h. In dev, allow them up to glbUrlExpiresAt
+        // so cross-session cache works without R2.
+        if (isUsableCachedDoc(data)) {
           return { action: 'cache_hit', glbUrl: data.glbUrl };
         }
+        dlog('attemptClaim: ready doc not usable (expired Tripo or prod-Tripo), re-claiming', slug);
       }
       if (data.status === 'pending') {
         const claimedAt = data.claimedAt?.toMillis?.() ?? 0;
@@ -354,14 +401,21 @@ async function persistGlbToR2(slug, sourceUrl) {
   return data?.glbUrl ?? null;
 }
 
-async function markReady(slug, glbUrl, sourceVin) {
+async function markReady(slug, glbUrl, sourceVin, opts = {}) {
   try {
-    await updateDoc(doc(db, 'models3d', slug), {
+    const patch = {
       status: 'ready',
       glbUrl,
       generatedAt: serverTimestamp(),
       sourceVin: sourceVin || null,
-    });
+      glbUrlSource: opts.source || (isTripoCdnUrl(glbUrl) ? 'tripo' : 'r2'),
+    };
+    // expiresAt is only set for Tripo URLs in dev; R2 URLs never expire so
+    // we explicitly omit the field rather than carrying a stale one over.
+    if (typeof opts.expiresAt === 'number') {
+      patch.glbUrlExpiresAt = opts.expiresAt;
+    }
+    await updateDoc(doc(db, 'models3d', slug), patch);
   } catch (err) {
     console.warn('models3d markReady failed', err);
   }
@@ -375,6 +429,114 @@ async function markFailed(slug, reason) {
       failedAt: serverTimestamp(),
     });
   } catch {}
+}
+
+// ─── Refresh-resilient Tripo job recovery ───────────────────────────────────
+// Tripo3D charges per submitted task, NOT per poll. So when a user refreshes
+// mid-generation the cheap fix is NOT to abandon the task — it's to poll the
+// SAME task_id on the next page load and pick up the result. If Tripo
+// finished while we were gone, we get the GLB for free; if it's still
+// running, we keep waiting.
+//
+// We persist the active task list to localStorage (per-tab, per-user, NOT
+// shared across users — only the originating client knows the task_id).
+// On next page load `recoverPendingJobs()` polls each entry and either
+// markReady's the GLB or drops it.
+//
+// We deliberately do NOT mark the slug doc as failed on unload anymore.
+// Letting it sit at status="pending" with a recoverable task_id is the only
+// path that doesn't waste $0.30 every refresh.
+const PENDING_JOBS_KEY = 'vincritiq_pending_3d_jobs_v1';
+// Tripo task_ids stay valid roughly as long as the source images do — give
+// ourselves 30 min to recover before we give up and re-claim.
+const RECOVERY_MAX_AGE_MS = 30 * 60 * 1000;
+
+function readPendingJobs() {
+  if (typeof localStorage === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(PENDING_JOBS_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch { return []; }
+}
+
+function writePendingJobs(list) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(PENDING_JOBS_KEY, JSON.stringify(list));
+  } catch {}
+}
+
+function recordPendingJob(slug, taskId, vin) {
+  if (!slug || !taskId) return;
+  const list = readPendingJobs().filter((j) => j.slug !== slug);
+  list.push({ slug, taskId, vin: vin || null, savedAt: Date.now() });
+  writePendingJobs(list);
+}
+
+function clearPendingJob(slug) {
+  if (!slug) return;
+  writePendingJobs(readPendingJobs().filter((j) => j.slug !== slug));
+}
+
+/**
+ * Resume any Tripo jobs that were interrupted by a previous page refresh.
+ * Called once on app boot. For each saved task:
+ *   - poll Tripo
+ *   - if success → persist to R2 / markReady (+clear from localStorage)
+ *   - if failed → markFailed (+clear)
+ *   - if still running → leave it; we'll try again next boot
+ *   - if older than RECOVERY_MAX_AGE_MS → drop the entry; next claim attempt
+ *     will re-run Tripo from scratch
+ *
+ * Safe to call multiple times. Idempotent. Catches all errors so it can never
+ * break the rest of the app boot.
+ */
+export async function recoverPendingJobs() {
+  const list = readPendingJobs();
+  if (list.length === 0) return;
+  dlog('recoverPendingJobs: scanning', { count: list.length });
+
+  for (const job of list) {
+    const ageMs = Date.now() - (job.savedAt || 0);
+    if (ageMs > RECOVERY_MAX_AGE_MS) {
+      dlog('recoverPendingJobs: dropping aged entry', { slug: job.slug, ageMin: Math.round(ageMs / 60000) });
+      clearPendingJob(job.slug);
+      continue;
+    }
+    try {
+      const { status, glbUrl } = await tripoPoll(job.taskId);
+      dlog('recoverPendingJobs: poll result', { slug: job.slug, status, hasUrl: !!glbUrl });
+      if (status === 'success' && glbUrl) {
+        // Try to persist to R2; fall back to dev / markFailed branches the
+        // same way generateOrFetch3D does.
+        try {
+          const r2Url = await persistGlbToR2(job.slug, glbUrl);
+          if (r2Url) {
+            await markReady(job.slug, r2Url, job.vin || null, { source: 'r2' });
+            dlog('recoverPendingJobs: recovered with R2 URL', { slug: job.slug });
+          } else if (process.env.NODE_ENV !== 'production') {
+            const expiresAt = Date.now() + 22 * 60 * 60 * 1000;
+            await markReady(job.slug, glbUrl, job.vin || null, { source: 'tripo', expiresAt });
+            dlog('recoverPendingJobs: recovered with Tripo URL (dev)', { slug: job.slug });
+          } else {
+            await markFailed(job.slug, 'recovery_r2_returned_null_in_prod');
+          }
+        } catch (err) {
+          dwarn('recoverPendingJobs: persist threw', err);
+          await markFailed(job.slug, 'recovery_persist_failed');
+        }
+        clearPendingJob(job.slug);
+      } else if (status === 'failed') {
+        await markFailed(job.slug, 'recovery_tripo_failed');
+        clearPendingJob(job.slug);
+      }
+      // else: still running/queued — leave for the next boot.
+    } catch (err) {
+      dwarn('recoverPendingJobs: poll threw', err);
+      // network blip — leave the entry, retry next time
+    }
+  }
 }
 
 // ─── Orchestrator: the new entry point ────────────────────────────────────────
@@ -453,11 +615,15 @@ export async function generateOrFetch3D({
       job = await submit3DJob(imageBase64, imageMediaType, vin);
     }
   } catch (err) {
-    if (slug && claim?.action === 'claim') await markFailed(slug, err?.message || 'submit_failed');
+    if (slug && claim?.action === 'claim') {
+      await markFailed(slug, err?.message || 'submit_failed');
+    }
     return null;
   }
   if (!job) {
-    if (slug && claim?.action === 'claim') await markFailed(slug, 'no_source_image');
+    if (slug && claim?.action === 'claim') {
+      await markFailed(slug, 'no_source_image');
+    }
     return null;
   }
   // Costs are committed at submit time — Tripo doesn't refund failed jobs.
@@ -467,15 +633,28 @@ export async function generateOrFetch3D({
   onCost?.({ label: 'Tripo3D image-to-3D', amount: 0.30, detail: `source: ${job.source}` });
   onProgress?.({ status: 'Pending', progress: 0 });
 
+  // Record this Tripo task to localStorage IMMEDIATELY after submit so a
+  // refresh-during-polling next page load can recover it (re-poll the same
+  // task_id) instead of re-submitting and double-charging.
+  if (slug && claim?.action === 'claim' && job.taskId) {
+    recordPendingJob(slug, job.taskId, vin || null);
+  }
+
   let tripoGlbUrl;
   try {
     tripoGlbUrl = await wait3DModel(job.taskId, onProgress, signal);
   } catch (err) {
-    if (slug && claim?.action === 'claim') await markFailed(slug, err?.message || 'wait_failed');
+    if (slug && claim?.action === 'claim') {
+      await markFailed(slug, err?.message || 'wait_failed');
+      clearPendingJob(slug);
+    }
     return null;
   }
   if (!tripoGlbUrl) {
-    if (slug && claim?.action === 'claim') await markFailed(slug, 'tripo_no_url');
+    if (slug && claim?.action === 'claim') {
+      await markFailed(slug, 'tripo_no_url');
+      clearPendingJob(slug);
+    }
     return null;
   }
 
@@ -488,16 +667,28 @@ export async function generateOrFetch3D({
       const r2Url = await persistGlbToR2(slug, tripoGlbUrl);
       if (r2Url) {
         finalUrl = r2Url;
-        await markReady(slug, r2Url, vin || null);
+        await markReady(slug, r2Url, vin || null, { source: 'r2' });
         dlog('R2 persist OK; markReady with R2 URL', { r2Url: r2Url.slice(0, 80) });
+      } else if (process.env.NODE_ENV !== 'production') {
+        // Dev mode (no R2 binding). Persist the raw Tripo URL with a 22h
+        // expiry — that's the lifetime of Tripo's CloudFront signature, and
+        // the read-side `isUsableCachedDoc` will reject it once we cross
+        // glbUrlExpiresAt. This makes cross-session cache work in dev: a
+        // second analysis of the same year/make/model/trim within the day
+        // hits the slug doc and reuses the GLB instead of re-running Tripo.
+        const expiresAt = Date.now() + 22 * 60 * 60 * 1000;
+        await markReady(slug, tripoGlbUrl, vin || null, { source: 'tripo', expiresAt });
+        dlog('Dev: markReady with Tripo URL + expiresAt', {
+          tripoUrl: tripoGlbUrl.slice(0, 80),
+          expiresInH: 22,
+        });
       } else {
-        // Dev mode (no R2 binding) returns null. Caching the raw Tripo URL
-        // would set up a 403 the next day when the signed URL expires, so
-        // we explicitly mark the slug as failed instead. The current session
-        // still gets the live Tripo URL through `finalUrl`; subsequent
-        // analyses for this trim will simply re-generate.
-        await markFailed(slug, 'dev_no_r2_persistence');
-        dlog('R2 returned null (dev mode); marked failed (Tripo URL is short-lived)');
+        // Production with R2 returning null = MODELS_PUBLIC_BASE missing.
+        // Persist nothing; mark failed so the next request re-claims and the
+        // user sees the procedural fallback rather than a guaranteed-CORS
+        // error from a Tripo URL.
+        await markFailed(slug, 'r2_returned_null_in_prod');
+        dlog('Prod: R2 returned null — MODELS_PUBLIC_BASE likely unset; marked failed');
       }
     } catch (err) {
       dwarn('R2 persist threw; falling back to Tripo URL for this session', err);
@@ -511,6 +702,10 @@ export async function generateOrFetch3D({
         });
       } catch {}
     }
+    // Generation finished (success or terminal failure) — drop the
+    // localStorage recovery entry so we don't re-poll a finalized task on
+    // the next page load.
+    clearPendingJob(slug);
   }
 
   // Final URL the caller hands to <GLBScene>. In production this is an R2

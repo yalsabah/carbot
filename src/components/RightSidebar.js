@@ -7,6 +7,7 @@ import {
   Coins,
   Gauge,
   Sparkles,
+  ExternalLink,
 } from 'lucide-react';
 import { aggregateContextStats, CLAUDE_CONTEXT_WINDOW } from '../utils/contextStats';
 import { formatUsd } from '../utils/pricing';
@@ -29,19 +30,43 @@ function fmtNum(n) {
 }
 
 function FilesPanel({ messages, onPreviewImage }) {
-  // Walk every message in order; collect attachments. Prefer the in-session
-  // _attachments array (real data URLs); fall back to the textual `files`
-  // chips for messages loaded from history.
+  // Walk every message in order and collect attachments. Source priority
+  // mirrors MessageBubble:
+  //   1. _attachments  (in-session, data URLs — fastest)
+  //   2. imageUrls     (Firestore-persisted Storage URLs — survives refresh)
+  //                    + PDF chips lifted from `files`
+  //   3. files         (text-only fallback)
+  // Without this triage, a refresh leaves the sidebar showing broken-image
+  // placeholders even though the URLs are right there on the message.
   const items = useMemo(() => {
     const collected = [];
     for (const m of messages) {
-      const list = Array.isArray(m._attachments) && m._attachments.length > 0
-        ? m._attachments
-        : (Array.isArray(m.files) ? m.files.map((f) => ({
-            kind: typeof f === 'string' && f.includes('📄') ? 'pdf' : 'image',
-            name: typeof f === 'string' ? f.replace(/^[^a-zA-Z0-9]*\s*/, '') : 'file',
-            dataUrl: null,
-          })) : []);
+      let list;
+      if (Array.isArray(m._attachments) && m._attachments.length > 0) {
+        list = m._attachments;
+      } else if (Array.isArray(m.imageUrls) && m.imageUrls.length > 0) {
+        list = [];
+        for (const f of m.files || []) {
+          if (typeof f === 'string' && f.includes('📄')) {
+            list.push({
+              kind: 'pdf',
+              name: f.replace(/^[^a-zA-Z0-9]*\s*/, ''),
+              dataUrl: null,
+            });
+          }
+        }
+        for (const u of m.imageUrls) {
+          list.push({ kind: 'image', name: u.name, dataUrl: u.url });
+        }
+      } else if (Array.isArray(m.files)) {
+        list = m.files.map((f) => ({
+          kind: typeof f === 'string' && f.includes('📄') ? 'pdf' : 'image',
+          name: typeof f === 'string' ? f.replace(/^[^a-zA-Z0-9]*\s*/, '') : 'file',
+          dataUrl: null,
+        }));
+      } else {
+        list = [];
+      }
       for (const a of list) collected.push({ ...a, msgId: m.id });
     }
     return collected;
@@ -105,21 +130,55 @@ function FilesPanel({ messages, onPreviewImage }) {
             Documents ({pdfs.length})
           </div>
           <div className="space-y-1">
-            {pdfs.map((p, i) => (
-              <div
-                key={i}
-                className="flex items-center gap-2 text-xs px-2 py-1.5 rounded-md"
-                style={{
-                  background: 'var(--color-bg)',
-                  border: '1px solid var(--color-border)',
-                  color: 'var(--color-text)',
-                }}
-                title={p.name}
-              >
-                <FileText size={12} style={{ color: 'var(--color-muted)', flexShrink: 0 }} />
-                <span className="truncate">{p.name}</span>
-              </div>
-            ))}
+            {pdfs.map((p, i) => {
+              const canOpen = !!p.dataUrl;
+              const handleOpen = () => {
+                if (!canOpen) return;
+                // Open in a new tab so the user gets the browser's native PDF
+                // viewer (search, zoom, page navigation) without leaving the
+                // app. Data URLs work in Chrome/Firefox/Safari for PDF preview.
+                const w = window.open();
+                if (w) {
+                  w.document.title = p.name;
+                  w.document.body.style.margin = '0';
+                  const iframe = w.document.createElement('iframe');
+                  iframe.src = p.dataUrl;
+                  iframe.style.cssText =
+                    'border:0;width:100vw;height:100vh;display:block;';
+                  w.document.body.appendChild(iframe);
+                }
+              };
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={handleOpen}
+                  disabled={!canOpen}
+                  className="w-full flex items-center gap-2 text-xs px-2 py-1.5 rounded-md text-left transition-colors disabled:cursor-not-allowed"
+                  style={{
+                    background: 'var(--color-bg)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                    opacity: canOpen ? 1 : 0.6,
+                    cursor: canOpen ? 'pointer' : 'default',
+                  }}
+                  title={
+                    canOpen
+                      ? `Open ${p.name} in a new tab`
+                      : `${p.name} (re-attach to preview — original file not retained after refresh)`
+                  }
+                >
+                  <FileText size={12} style={{ color: 'var(--color-muted)', flexShrink: 0 }} />
+                  <span className="truncate flex-1">{p.name}</span>
+                  {canOpen && (
+                    <ExternalLink
+                      size={11}
+                      style={{ color: 'var(--color-muted)', flexShrink: 0 }}
+                    />
+                  )}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
@@ -188,6 +247,12 @@ function ContextMeter({ stats, onCompact, isCompacting }) {
   );
 }
 
+// Sidebar widths in px. The wrapper always renders both states overlapped
+// and animates `width` between them; the inner content fades with opacity so
+// neither side flashes during the transition.
+const COLLAPSED_W = 44;
+const EXPANDED_W = 280;
+
 export default function RightSidebar({
   messages,
   collapsed,
@@ -198,14 +263,27 @@ export default function RightSidebar({
 }) {
   const stats = useMemo(() => aggregateContextStats(messages), [messages]);
 
-  if (collapsed) {
-    return (
-      <aside
-        className="flex flex-col items-center py-3 flex-shrink-0"
+  return (
+    <aside
+      className="flex-shrink-0 overflow-hidden"
+      style={{
+        position: 'relative',
+        width: collapsed ? COLLAPSED_W : EXPANDED_W,
+        background: 'var(--color-surface)',
+        borderLeft: '1px solid var(--color-border)',
+        transition: 'width 220ms cubic-bezier(0.4, 0, 0.2, 1)',
+      }}
+    >
+      {/* Collapsed-state handle. Stays in DOM and fades — that way clicking
+          the chevron during a transition still works. pointer-events guards
+          against accidental clicks through the layer that's fading out. */}
+      <div
+        className="absolute inset-y-0 left-0 flex flex-col items-center py-3"
         style={{
-          width: 44,
-          background: 'var(--color-surface)',
-          borderLeft: '1px solid var(--color-border)',
+          width: COLLAPSED_W,
+          opacity: collapsed ? 1 : 0,
+          pointerEvents: collapsed ? 'auto' : 'none',
+          transition: 'opacity 180ms ease',
         }}
       >
         <button
@@ -224,19 +302,20 @@ export default function RightSidebar({
             style={{ background: '#dc2626' }}
           />
         )}
-      </aside>
-    );
-  }
+      </div>
 
-  return (
-    <aside
-      className="flex flex-col flex-shrink-0 overflow-hidden"
-      style={{
-        width: 280,
-        background: 'var(--color-surface)',
-        borderLeft: '1px solid var(--color-border)',
-      }}
-    >
+      {/* Expanded-state body. Fixed at EXPANDED_W so content never reflows
+          mid-transition; instead the wrapper's overflow:hidden masks it as
+          the wrapper's width animates. */}
+      <div
+        className="absolute inset-y-0 left-0 flex flex-col overflow-hidden"
+        style={{
+          width: EXPANDED_W,
+          opacity: collapsed ? 0 : 1,
+          pointerEvents: collapsed ? 'none' : 'auto',
+          transition: 'opacity 200ms ease 60ms',
+        }}
+      >
       {/* Header */}
       <div
         className="flex items-center justify-between px-4 py-3"
@@ -310,6 +389,7 @@ export default function RightSidebar({
           </div>
           <FilesPanel messages={messages} onPreviewImage={onPreviewImage} />
         </section>
+      </div>
       </div>
     </aside>
   );
