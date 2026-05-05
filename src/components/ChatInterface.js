@@ -524,6 +524,94 @@ function MessageBubble({
 	);
 }
 
+// Module-level cache of url → { base64, mediaType }. Populated lazily by
+// fetchUrlAsBase64 so re-using the same Storage URL across many follow-up
+// turns (or after a refresh) doesn't re-download the bytes every time.
+const _imageBase64Cache = new Map();
+
+async function fetchUrlAsBase64(url) {
+	if (!url) return null;
+	if (_imageBase64Cache.has(url)) return _imageBase64Cache.get(url);
+	try {
+		const res = await fetch(url);
+		if (!res.ok) return null;
+		const blob = await res.blob();
+		const mediaType = blob.type || "image/jpeg";
+		const base64 = await new Promise((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = () => {
+				// strip "data:...;base64," prefix
+				const s = String(reader.result || "");
+				const i = s.indexOf(",");
+				resolve(i >= 0 ? s.slice(i + 1) : s);
+			};
+			reader.onerror = reject;
+			reader.readAsDataURL(blob);
+		});
+		const entry = { base64, mediaType };
+		_imageBase64Cache.set(url, entry);
+		return entry;
+	} catch {
+		return null;
+	}
+}
+
+// Walk the message list backwards looking for the most recent user-attached
+// CARFAX text and image set. Returns the inputs we'd need to pass back into
+// streamCarAnalysis() so a follow-up turn or a refresh-then-followup retains
+// the visual + document context. Without this, "what color are the rims?"
+// after refresh asks Claude with no images and gets a nonsense answer.
+//
+// Source priority for images:
+//   1. _attachments[i].dataUrl  (in-session, no network)
+//   2. imageUrls[i].url         (Firebase Storage; we fetch + base64 once,
+//                                cached across calls)
+async function collectHistoryAttachments(messages) {
+	let carfaxText = "";
+	let images = [];
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i];
+		if (m.role !== "user") continue;
+		if (!carfaxText && typeof m.carfaxText === "string" && m.carfaxText) {
+			carfaxText = m.carfaxText;
+		}
+		if (!carfaxText && typeof m._carfaxText === "string" && m._carfaxText) {
+			carfaxText = m._carfaxText;
+		}
+		if (images.length === 0) {
+			if (Array.isArray(m._attachments) && m._attachments.length) {
+				const fromAtt = [];
+				for (const a of m._attachments) {
+					if (a.kind !== "image" || !a.dataUrl) continue;
+					const [meta, data] = String(a.dataUrl).split(",");
+					const mediaType = (meta.match(/data:([^;]+)/) || [])[1] || "image/jpeg";
+					if (data) fromAtt.push({ base64: data, mediaType, name: a.name });
+				}
+				if (fromAtt.length) images = fromAtt;
+			}
+			if (images.length === 0 && Array.isArray(m.imageUrls) && m.imageUrls.length) {
+				const fetched = await Promise.all(
+					m.imageUrls.map(async (u) => {
+						const e = await fetchUrlAsBase64(u.url);
+						return e ? { base64: e.base64, mediaType: e.mediaType, name: u.name } : null;
+					}),
+				);
+				images = fetched.filter(Boolean);
+			}
+		}
+		// Stop once we've seen a user turn that had any attachment indicator.
+		// Earlier turns are by definition older; we don't want to fall through.
+		if (
+			carfaxText ||
+			images.length > 0 ||
+			(Array.isArray(m.files) && m.files.length > 0)
+		) {
+			break;
+		}
+	}
+	return { carfaxText, images };
+}
+
 // ─── Main ChatInterface ────────────────────────────────────────────────────────
 export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTriggerRef, onCompactingChange }) {
 	const { user, userDoc } = useAuth();
@@ -747,40 +835,58 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 						}
 						return { ...prev, glbUrl: result.glbUrl, modelStatus: "Done" };
 					});
-					// Persist the glbUrl + status onto the assistant message. We
-					// write to BOTH `_glbUrl` (in-memory only) and `glbUrl`
-					// (Firestore-persisted) so the URL survives a page refresh or
-					// a chat-switch round-trip without re-running Tripo3D.
-					//
-					// Tripo CDN URLs are CloudFront-signed and expire ~24 h. In
-					// production R2 takes over via persistGlbToR2 → R2 URLs don't
-					// expire and `result.glbUrl` is already an R2 URL. In dev
-					// (no R2), result.glbUrl IS a Tripo URL → we record an
-					// expiresAt 22h out so refresh-within-the-day still hits the
-					// cache; expired entries are ignored on read.
-					//
-					// The url shape: in dev the proxy rewrites /dev-glb-proxy?url=...
-					// — we store the raw Tripo URL (the unproxied form) so we can
-					// detect expiry via TRIPO_CDN_RE. The display path re-proxies.
-					const isTripoCdn = /tripo3d\.com\//.test(result.glbUrl);
-					const isProxied = result.glbUrl.startsWith('/dev-glb-proxy');
-					const persistableUrl = isProxied
-						? decodeURIComponent(result.glbUrl.split('url=')[1] || '')
-						: result.glbUrl;
-					const patch = {
-						glbUrl: persistableUrl,
-						glbUrlSource: isTripoCdn || isProxied ? 'tripo' : 'r2',
-					};
-					if (isTripoCdn || isProxied) {
-						patch.glbUrlExpiresAt = Date.now() + 22 * 60 * 60 * 1000;
-					}
+					// In-memory always: lets close-and-reopen of the modal in the
+					// CURRENT session keep showing the GLB without re-fetching.
 					updateLastMessage((prev) => ({
 						...prev,
 						_glbUrl: result.glbUrl,
 						_modelStatus: "Done",
-						...patch,
 					}));
-					if (sessionId && messageId) {
+
+					// What we persist to Firestore depends on the URL origin:
+					//
+					//   - R2 URL (production happy path): persist freely. R2 URLs
+					//     don't expire and the bucket has CORS configured.
+					//
+					//   - Tripo CDN URL (dev — no R2 binding): persist the RAW
+					//     Tripo URL (the unproxied form so the expiry check
+					//     stays meaningful). The display path re-proxies it
+					//     through /dev-glb-proxy. Set glbUrlExpiresAt 22h out so
+					//     refresh-within-the-day still hits the cache; expired
+					//     entries are filtered out on read.
+					//
+					//   - Tripo URL in PRODUCTION: never persist. That would
+					//     mean R2 is misconfigured (MODELS_PUBLIC_BASE missing)
+					//     and persisting a no-CORS URL guarantees the modal
+					//     hard-errors on refresh.
+					const isTripoCdn = /tripo3d\.com\//.test(result.glbUrl);
+					const isProxied = result.glbUrl.startsWith('/dev-glb-proxy');
+					// In dev, result.glbUrl is the proxied form; recover the raw
+					// Tripo URL out of it for persistence.
+					const rawUrl = isProxied
+						? decodeURIComponent(result.glbUrl.split("url=")[1] || "")
+						: result.glbUrl;
+					const rawIsTripo = /tripo3d\.com\//.test(rawUrl);
+
+					if (rawIsTripo) {
+						if (isDev && sessionId && messageId) {
+							const patch = {
+								glbUrl: rawUrl,
+								glbUrlSource: "tripo",
+								glbUrlExpiresAt: Date.now() + 22 * 60 * 60 * 1000,
+							};
+							updateLastMessage((prev) => ({ ...prev, ...patch }));
+							updateMessage(sessionId, messageId, patch);
+						} else if (!isDev) {
+							console.warn(
+								"[3d] R2 returned a Tripo URL in production — MODELS_PUBLIC_BASE likely not set. Not persisting.",
+								{ sample: result.glbUrl.slice(0, 80) },
+							);
+						}
+					} else if (!isTripoCdn && !isProxied && sessionId && messageId) {
+						// R2 URL — production happy path.
+						const patch = { glbUrl: result.glbUrl, glbUrlSource: "r2" };
+						updateLastMessage((prev) => ({ ...prev, ...patch }));
 						updateMessage(sessionId, messageId, patch);
 					}
 				} else {
@@ -837,7 +943,25 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			// PDFs stay as kind:'pdf' chips. Images carry a data URL for preview.
 			const userAttachments = [];
 			if (carfaxFile) {
-				userAttachments.push({ kind: "pdf", name: carfaxFile.name });
+				// Carry a data URL on the PDF chip so the sidebar can open it
+				// in a new tab (native browser PDF viewer). Only kept in-session;
+				// after refresh the dataUrl is gone and the chip becomes a label.
+				let pdfDataUrl = null;
+				try {
+					pdfDataUrl = await new Promise((resolve, reject) => {
+						const r = new FileReader();
+						r.onload = () => resolve(r.result);
+						r.onerror = reject;
+						r.readAsDataURL(carfaxFile);
+					});
+				} catch {
+					pdfDataUrl = null;
+				}
+				userAttachments.push({
+					kind: "pdf",
+					name: carfaxFile.name,
+					dataUrl: pdfDataUrl,
+				});
 			}
 			for (const img of compressedImages) {
 				try {
@@ -857,10 +981,28 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			setInput("");
 			if (textareaRef.current) textareaRef.current.style.height = "";
 
+			// Extract CARFAX text up-front so we can persist it on the user
+			// message. Doing it here (rather than in the analyze step below)
+			// means follow-up turns can read it from the message history
+			// without re-parsing, and refresh-then-follow-up still works.
+			let userCarfaxText = "";
+			if (carfaxFile) {
+				try {
+					userCarfaxText = await extractTextFromPDF(carfaxFile);
+				} catch {
+					userCarfaxText = "";
+				}
+			}
+
 			const userMessageId = await addMessage(sessionId, {
 				role: "user",
 				text: userText,
 				files: userFiles,
+				// `carfaxText` (no underscore) — persisted to Firestore so
+				// follow-up turns / regenerates can re-include the document
+				// after a refresh. Typical sizes are 5-15KB; well under the
+				// Firestore 1MB-per-doc limit.
+				carfaxText: userCarfaxText || null,
 				_attachments: userAttachments,
 			});
 
@@ -907,7 +1049,9 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				updateLastMessage((prev) => ({ ...prev, steps: [...steps] }));
 			};
 
-			let carfaxText = "";
+			// CARFAX was already extracted up-front (so it could be persisted
+			// on the user message). Just surface progress for the user.
+			let carfaxText = userCarfaxText || "";
 			// Multi-image: array of { base64, mediaType, name } sent to Claude.
 			// imageBase64 / imageMediaType remain populated with the FIRST image
 			// for back-compat with the rest of the pipeline (Tripo3D, modal preview).
@@ -918,14 +1062,13 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 
 			if (carfaxFile) {
 				pushStep(`Reading CARFAX PDF: ${carfaxFile.name}`);
-				try {
-					carfaxText = await extractTextFromPDF(carfaxFile);
+				if (carfaxText) {
 					const vinMatch = carfaxText.match(/\b[A-HJ-NPR-Z0-9]{17}\b/);
 					doneStep(
 						steps.length - 1,
 						`CARFAX extracted${vinMatch ? ` · VIN: ${vinMatch[0]}` : ""} · ${Math.round(carfaxText.length / 1000)}k chars`,
 					);
-				} catch {
+				} else {
 					carfaxText = "[PDF parsing failed]";
 					failStep(
 						steps.length - 1,
@@ -1282,10 +1425,17 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				cost.add('Vincario decode', FIXED_COSTS.vincario_decode, 'paid VIN decode');
 			}
 
+			// Re-attach the most recent CARFAX + photos to this follow-up turn
+			// so questions like "what color are the rims?" can actually look at
+			// the photos. fetchUrlAsBase64 caches per-URL, so the second
+			// follow-up doesn't re-download.
+			const history = await collectHistoryAttachments(messages);
+
 			let fullText = "";
 			try {
 				const stream = streamCarAnalysis({
-					carfaxText: "",
+					carfaxText: history.carfaxText || "",
+					images: history.images,
 					messages: [...messages, { role: "user", text }],
 					userMemory: buildUserMemory(),
 					vinDecode: vinDecodeBlock,
@@ -1381,12 +1531,27 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				cost.add('Vincario decode', FIXED_COSTS.vincario_decode, 'paid VIN decode');
 			}
 
+			// Pull attachments from the truncated history so a re-analyze still
+			// has the visual context, even after a refresh (where in-memory
+			// _carfaxText / _img64 are gone but persisted carfaxText / imageUrls
+			// remain). The msg object itself is preferred over collectHistory…
+			// because edit always re-uses the EDITED message's own attachments.
+			let editCarfaxText = carfaxText;
+			let editImages = imageBase64 && imageMediaType
+				? [{ base64: imageBase64, mediaType: imageMediaType }]
+				: [];
+			if (!editCarfaxText && typeof msg.carfaxText === "string") editCarfaxText = msg.carfaxText;
+			if (editImages.length === 0) {
+				const recovered = await collectHistoryAttachments([msg]);
+				if (recovered.images.length) editImages = recovered.images;
+				if (!editCarfaxText && recovered.carfaxText) editCarfaxText = recovered.carfaxText;
+			}
+
 			let fullText = "";
 			try {
 				const stream = streamCarAnalysis({
-					carfaxText,
-					imageBase64,
-					imageMediaType,
+					carfaxText: editCarfaxText || "",
+					images: editImages,
 					messages: [...truncated, { role: "user", text: newText }],
 					userMemory: buildUserMemory(),
 					vinDecode: vinDecodeBlock,
@@ -1595,14 +1760,34 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 												break;
 											}
 										}
-										// glbUrl: prefer in-memory _glbUrl, then Firestore `glbUrl` (only if
-										// not past `glbUrlExpiresAt` — that field guards against showing a
-										// stale Tripo CDN URL after the 24h signature expires).
+										// glbUrl resolution:
+										//   - in-memory _glbUrl is always preferred (already proxied
+										//     for dev, R2-direct in prod).
+										//   - Firestore glbUrl: in dev, route Tripo URLs through
+										//     /dev-glb-proxy (browser CORS bypass). In prod, refuse
+										//     them — Tripo CDN serves no CORS headers, so loading
+										//     directly hard-errors. lookupCachedModel inside openReport
+										//     can still recover an R2 URL from models3d/{slug}.
+										//   - glbUrlExpiresAt: ignore the persisted URL if past
+										//     expiry (Tripo's CloudFront signatures last ~24h).
+										const isTripoUrl = (u) =>
+											typeof u === "string" && /tripo3d\.com\//.test(u);
+										const isDevEnv = process.env.NODE_ENV !== "production";
 										let resolvedGlbUrl = m._glbUrl || null;
 										if (!resolvedGlbUrl && m.glbUrl) {
 											const expiresAt = m.glbUrlExpiresAt;
-											const expired = typeof expiresAt === "number" && Date.now() > expiresAt;
-											if (!expired) resolvedGlbUrl = m.glbUrl;
+											const expired =
+												typeof expiresAt === "number" && Date.now() > expiresAt;
+											if (!expired) {
+												if (isTripoUrl(m.glbUrl)) {
+													if (isDevEnv) {
+														resolvedGlbUrl = `/dev-glb-proxy?url=${encodeURIComponent(m.glbUrl)}`;
+													}
+													// prod: leave null — fall through to lookupCachedModel
+												} else {
+													resolvedGlbUrl = m.glbUrl;
+												}
+											}
 										}
 										openReport(
 											m.report,

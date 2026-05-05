@@ -148,6 +148,13 @@ export async function* streamCarAnalysis({
     body: JSON.stringify({
       model: MODEL,
       max_tokens: 4096,
+      // temperature: 0 — verdict rules in the system prompt are strict (heavy
+      // flags hard-cap the rating, etc.); the default temperature of 1.0 lets
+      // the model occasionally ignore those caps and produce wildly different
+      // ratings (Great vs Fair) for the same vehicle on consecutive runs.
+      // Pinning to 0 keeps the same VIN/CARFAX/photos returning the same
+      // verdict and the same numbers.
+      temperature: 0,
       system: SYSTEM_PROMPT(userMemory),
       messages: apiMessages,
       stream: true,
