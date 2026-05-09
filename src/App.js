@@ -1,7 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { AuthProvider } from './contexts/AuthContext';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { recoverPendingJobs } from './utils/model3d';
-import { ThemeProvider } from './contexts/ThemeContext';
+import { verifyCheckoutSession } from './utils/stripeClient';
+import { doc, updateDoc } from 'firebase/firestore';
+import { db } from './firebase/config';
+import { ThemeProvider, useTheme } from './contexts/ThemeContext';
+import { Loader2 } from 'lucide-react';
 import { ChatProvider, useChat } from './contexts/ChatContext';
 import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
@@ -24,6 +28,65 @@ function AppInner() {
   // sidebar's "Compact Chat" button can invoke the same code path as typing
   // /compact in the input.
   const compactTriggerRef = useRef(null);
+  const { user, userDoc, refreshUserDoc, signingIn } = useAuth();
+  const { dark, setDark } = useTheme();
+
+  // Sync theme from the signed-in user's preferences.
+  //
+  // The hard part of this is the race between two effects:
+  //   (1) When userDoc lands, call setDark(saved value).
+  //   (2) When `dark` changes, persist to Firestore.
+  // Both effects run after the SAME render commit, in declaration order.
+  // Effect (1)'s setDark queues a state update — `dark` itself doesn't
+  // reflect the new value until the next render. So if effect (2) runs
+  // immediately after, it sees the OLD `dark`, sees that it differs from
+  // userDoc.preferences.theme, and writes the WRONG value back to Firestore
+  // — overwriting the user's actual preference with whatever the page
+  // happened to be showing at sign-in.
+  //
+  // Fix: gate effect (2) behind a "ready to persist" flag that flips ON
+  // one tick AFTER effect (1) ran. By the time the flag is true, the
+  // setDark from effect (1) has propagated to `dark`, so effect (2) reads
+  // the correct value. The flag also resets whenever the uid changes so
+  // a different user's sign-in can't inherit the previous user's gate.
+  const appliedThemeForUidRef = useRef(null);
+  const themeReadyForPersistRef = useRef(false);
+
+  // Reset the persist gate when uid changes — covers sign-out → sign-in
+  // with a different user.
+  useEffect(() => {
+    themeReadyForPersistRef.current = false;
+    appliedThemeForUidRef.current = null;
+  }, [user?.uid]);
+
+  // Effect (1): apply the user's saved theme exactly once per uid.
+  useEffect(() => {
+    if (!user?.uid || !userDoc) return;
+    if (appliedThemeForUidRef.current === user.uid) return;
+    appliedThemeForUidRef.current = user.uid;
+    const saved = userDoc?.preferences?.theme;
+    if (saved === 'dark' || saved === 'light') {
+      setDark(saved === 'dark');
+    }
+    // Defer enabling persistence until the setDark above has had a chance
+    // to commit. setTimeout(0) yields to the next microtask, after which
+    // any future `dark` change is necessarily a real user toggle.
+    const t = setTimeout(() => {
+      themeReadyForPersistRef.current = true;
+    }, 0);
+    return () => clearTimeout(t);
+  }, [user?.uid, userDoc, setDark]);
+
+  // Effect (2): persist user-initiated theme changes back to Firestore.
+  useEffect(() => {
+    if (!user?.uid) return;
+    if (!themeReadyForPersistRef.current) return;
+    const pref = dark ? 'dark' : 'light';
+    if (userDoc?.preferences?.theme === pref) return;
+    updateDoc(doc(db, 'users', user.uid), {
+      'preferences.theme': pref,
+    }).catch(() => {});
+  }, [dark, user?.uid, userDoc?.preferences?.theme]);
 
   // On boot, recover any Tripo 3D jobs that were in-flight when the user
   // refreshed/closed the tab. This polls each saved task_id and persists
@@ -31,6 +94,54 @@ function AppInner() {
   useEffect(() => {
     recoverPendingJobs().catch(() => {});
   }, []);
+
+  // Post-Stripe-checkout handler. Stripe redirects to /?stripe=success&session_id=…
+  // We verify the session server-side, then write the new plan to the user's
+  // Firestore doc (allowed by per-user rules — no Firebase Admin needed).
+  // Strips the params from the URL afterward so a refresh doesn't re-run.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const stripeStatus = params.get('stripe');
+    if (!stripeStatus) return;
+
+    const cleanUrl = () => {
+      params.delete('stripe');
+      params.delete('session_id');
+      const next = params.toString();
+      window.history.replaceState({}, '', `${window.location.pathname}${next ? '?' + next : ''}`);
+    };
+
+    if (stripeStatus !== 'success') {
+      cleanUrl();
+      return;
+    }
+    const sessionId = params.get('session_id');
+    if (!sessionId || !user?.uid) {
+      cleanUrl();
+      return;
+    }
+
+    (async () => {
+      const result = await verifyCheckoutSession({ sessionId, uid: user.uid });
+      if (result.ok && result.planId) {
+        try {
+          await updateDoc(doc(db, 'users', user.uid), {
+            plan: result.planId,
+            stripeCustomerId: result.customerId || null,
+            stripeSubscriptionId: result.subscriptionId || null,
+            subscriptionStatus: 'active',
+            subscriptionUpdatedAt: Date.now(),
+          });
+          await refreshUserDoc();
+        } catch (err) {
+          console.warn('[stripe] Firestore write after checkout failed', err);
+        }
+      } else {
+        console.warn('[stripe] Checkout verification failed:', result.error);
+      }
+      cleanUrl();
+    })();
+  }, [user, refreshUserDoc]);
 
   return (
     <div className="flex h-screen overflow-hidden" style={{ background: 'var(--color-bg)' }}>
@@ -73,6 +184,31 @@ function AppInner() {
             className="max-w-[90vw] max-h-[90vh] rounded-lg shadow-2xl"
             style={{ objectFit: 'contain' }}
           />
+        </div>
+      )}
+
+      {/* Welcome-back loading screen — covers the ~1s window right after a
+          fresh sign-in so the user sees a deliberate "logging you in" state
+          instead of the auth modal jump-cutting straight to the populated
+          chat. AuthContext flips signingIn back to false on a timer. */}
+      {signingIn && (
+        <div
+          className="fixed inset-0 z-[90] flex flex-col items-center justify-center gap-3"
+          style={{
+            background: 'var(--color-bg)',
+            animation: 'fadeIn 200ms ease',
+          }}
+          role="status"
+          aria-live="polite"
+        >
+          <Loader2
+            size={32}
+            className="animate-spin"
+            style={{ color: 'var(--color-accent)' }}
+          />
+          <div className="text-sm font-medium" style={{ color: 'var(--color-muted)' }}>
+            Signing you in…
+          </div>
         </div>
       )}
 

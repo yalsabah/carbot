@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { X, Award, DollarSign, BarChart2, TrendingDown, Cpu, RotateCcw, Sliders, RefreshCw, Image as ImageIcon, Box } from 'lucide-react';
+import { X, Award, DollarSign, BarChart2, TrendingDown, Cpu, RotateCcw, Sliders, RefreshCw, Image as ImageIcon, Box, Plus } from 'lucide-react';
 import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, useGLTF, Environment } from '@react-three/drei';
 import * as THREE from 'three';
@@ -750,10 +750,39 @@ function ViewTabs({ active, onChange, modelStatus }) {
   );
 }
 
-function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect, activeTab, userImages }) {
+function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect, activeTab, userImages, onAddImage }) {
   const showGLB = !!glbUrl;
   const bodyStyle = inferBodyStyle(vehicle);
   const activeSwatch = BODY_COLORS.find(c => c.id === activeColorId) || null;
+  const fileInputRef = useRef(null);
+
+  // Trigger condition for the "+ Add Image" CTA:
+  //   - No GLB rendered yet
+  //   - User never provided a vehicle photo (and VinAudit didn't supply one)
+  //   - Model pipeline is in a terminal state — i.e. we're not actively
+  //     generating right now. If we're mid-generation we want the existing
+  //     "Generating 3D model…" overlay, not the CTA.
+  // When all three hold, replace the procedural blocky-car fallback with a
+  // click-to-upload affordance so the user can opt-in to a real Tripo3D
+  // model without restarting the whole analysis.
+  const isTerminalStatus =
+    modelStatus === 'Done' ||
+    modelStatus === 'Failed' ||
+    modelStatus === 'CacheHit' ||
+    modelStatus === null ||
+    modelStatus === undefined;
+  const showAddImageCTA =
+    !showGLB &&
+    isTerminalStatus &&
+    (!Array.isArray(userImages) || userImages.length === 0) &&
+    typeof onAddImage === 'function';
+
+  const handlePickFile = (e) => {
+    const file = e.target.files?.[0];
+    // Reset the input so picking the same file twice still fires onChange.
+    if (e.target) e.target.value = '';
+    if (file) onAddImage(file);
+  };
 
   // Both panels are kept mounted; we toggle visibility via display rather
   // than conditionally rendering. Mounting/unmounting the <Canvas> on every
@@ -774,8 +803,50 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
         <Canvas camera={{ fov: 38 }} style={{ background: 'transparent' }}>
           <GLBScene url={glbUrl} swatch={activeSwatch} />
         </Canvas>
+      ) : showAddImageCTA ? (
+        // Tier 1.5 — No source image was provided AND we're not currently
+        // generating, so the procedural blocky-car would be all the user
+        // sees. Offer them a click-to-upload affordance instead. On click,
+        // ChatInterface's handleAddImageToReport pushes the chosen file
+        // through the same Tripo pipeline used for live analyses.
+        <div className="absolute inset-0 flex items-center justify-center p-8">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handlePickFile}
+            style={{ display: 'none' }}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="group flex flex-col items-center justify-center gap-3 rounded-2xl px-8 py-10 transition-all hover:scale-[1.02]"
+            style={{
+              border: '2px dashed var(--color-border)',
+              background: 'var(--color-bg)',
+              minWidth: 280,
+              cursor: 'pointer',
+            }}
+          >
+            <div
+              className="rounded-full p-3 transition-colors group-hover:bg-blue-500/10"
+              style={{ background: 'var(--color-surface)' }}
+            >
+              <Plus size={28} style={{ color: 'var(--color-accent)' }} />
+            </div>
+            <div className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+              Add Image of Vehicle
+            </div>
+            <div
+              className="text-xs text-center max-w-[240px]"
+              style={{ color: 'var(--color-muted)' }}
+            >
+              Upload a photo to generate an interactive 3D model — takes about 1–2 minutes.
+            </div>
+          </button>
+        </div>
       ) : (
-        // Tier 2 — Pipeline procedural 3D (always — never fall back to photo)
+        // Tier 2 — Pipeline procedural 3D (used when we ARE generating, so
+        // the blocky fallback spins behind the loading overlay).
         <VehicleCanvas
           vehicleColor={vehicleColor}
           wheelColor={wheelColor || 'gunmetal'}
@@ -796,7 +867,7 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
           the gap between the report streaming and startRodinJob's first
           progress callback) as "still generating" so the user always sees the
           message immediately when they switch to the 3D Model tab. */}
-      {!showGLB && (() => {
+      {!showGLB && !showAddImageCTA && (() => {
         const isTerminal =
           modelStatus === 'Done' || modelStatus === 'Failed' || modelStatus === 'CacheHit';
         const generating = !isTerminal;
@@ -861,7 +932,7 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
   );
 }
 
-export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, userImages = [], onClose, onConfirmEdits, isReanalyzing }) {
+export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, userImages = [], onAddImage, onClose, onConfirmEdits, isReanalyzing }) {
   const [exiting, setExiting] = useState(false);
   const closeTimer = useRef(null);
   // Color picker state. Seeded from the CARFAX/decoded color when possible so
@@ -917,6 +988,7 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
             onColorSelect={setActiveColorId}
             activeTab={activeTab}
             userImages={userImages}
+            onAddImage={onAddImage}
           />
 
           {/* Bottom gradient + info — theme-aware fade so text stays legible */}
