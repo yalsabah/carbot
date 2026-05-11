@@ -15,11 +15,13 @@ const pickEnv = (...names) => {
   }
   return undefined;
 };
-const CLAUDE_KEY      = pickEnv('CLAUDE_API_KEY', 'CLAUDE_KEY', 'REACT_APP_CLAUDE_API_KEY');
-const TRIPO_KEY       = pickEnv('TRIPO_KEY', 'TRIPO_API_KEY', 'REACT_APP_TRIPO_API_KEY');
-const VINAUDIT_KEY    = pickEnv('VINAUDIT_KEY', 'VINAUDIT_API_KEY', 'REACT_APP_VINAUDIT_API_KEY');
-const VINCARIO_KEY    = pickEnv('VINCARIO_KEY');
-const VINCARIO_SECRET = pickEnv('VINCARIO_SECRET');
+const CLAUDE_KEY        = pickEnv('CLAUDE_API_KEY', 'CLAUDE_KEY', 'REACT_APP_CLAUDE_API_KEY');
+const TRIPO_KEY         = pickEnv('TRIPO_KEY', 'TRIPO_API_KEY', 'REACT_APP_TRIPO_API_KEY');
+const VINAUDIT_KEY      = pickEnv('VINAUDIT_KEY', 'VINAUDIT_API_KEY', 'REACT_APP_VINAUDIT_API_KEY');
+const VINCARIO_KEY      = pickEnv('VINCARIO_KEY');
+const VINCARIO_SECRET   = pickEnv('VINCARIO_SECRET');
+const STRIPE_SECRET_KEY = pickEnv('STRIPE_SECRET_KEY');
+const PUBLIC_BASE_URL   = pickEnv('PUBLIC_BASE_URL') || 'http://localhost:3000';
 
 // Startup banner — confirms which keys actually loaded into this process.
 // Prints first/last 4 chars + length so you can eyeball it without leaking
@@ -36,6 +38,7 @@ console.log('  TRIPO_KEY      :', fingerprint(TRIPO_KEY));
 console.log('  VINAUDIT_KEY   :', fingerprint(VINAUDIT_KEY));
 console.log('  VINCARIO_KEY   :', fingerprint(VINCARIO_KEY));
 console.log('  VINCARIO_SECRET:', fingerprint(VINCARIO_SECRET));
+console.log('  STRIPE_SECRET  :', fingerprint(STRIPE_SECRET_KEY));
 
 const stripBrowserHeaders = (proxyReq) => {
   proxyReq.removeHeader('origin');
@@ -221,6 +224,133 @@ module.exports = function (app) {
     } catch (err) {
       console.warn('[dev-glb-proxy] fetch threw', err);
       res.status(502).json({ error: 'upstream_failed', message: String(err?.message || err) });
+    }
+  });
+
+  // ── Stripe (dev) ──────────────────────────────────────────────────
+  // Mirrors functions/api/stripe/* in production. We proxy directly to
+  // api.stripe.com with the dev STRIPE_SECRET_KEY (use a sk_test_ key in
+  // your .env). The webhook is intentionally NOT wired in dev — use the
+  // Stripe CLI's `stripe listen --forward-to localhost:3000/api/stripe/webhook`
+  // to test webhooks locally.
+  const ensureStripe = (res) => {
+    if (!STRIPE_SECRET_KEY) {
+      res.status(503).json({ error: 'Stripe is not configured (set STRIPE_SECRET_KEY in .env).' });
+      return false;
+    }
+    return true;
+  };
+
+  const readJsonBody = async (req) => {
+    if (req.body && typeof req.body === 'object') return req.body;
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
+    catch { return null; }
+  };
+
+  app.post('/api/stripe/create-checkout-session', async (req, res) => {
+    if (!ensureStripe(res)) return;
+    const body = await readJsonBody(req);
+    if (!body) return res.status(400).json({ error: 'invalid_json' });
+    const { uid, email, priceId, planId } = body;
+    if (!uid || !priceId) return res.status(400).json({ error: 'uid and priceId are required' });
+
+    const params = new URLSearchParams();
+    params.append('mode', 'subscription');
+    params.append('line_items[0][price]', priceId);
+    params.append('line_items[0][quantity]', '1');
+    params.append('client_reference_id', uid);
+    if (email) params.append('customer_email', email);
+    params.append('success_url', `${PUBLIC_BASE_URL}/?stripe=success&session_id={CHECKOUT_SESSION_ID}`);
+    params.append('cancel_url', `${PUBLIC_BASE_URL}/?stripe=cancelled`);
+    params.append('allow_promotion_codes', 'true');
+    if (planId) params.append('metadata[planId]', planId);
+    params.append('metadata[uid]', uid);
+
+    try {
+      const r = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: params,
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        console.warn('[stripe←] create-checkout-session', r.status, data?.error?.message);
+        return res.status(r.status).json({ error: data?.error?.message || `Stripe ${r.status}` });
+      }
+      res.json({ url: data.url, id: data.id });
+    } catch (err) {
+      res.status(500).json({ error: String(err?.message || err) });
+    }
+  });
+
+  app.post('/api/stripe/create-portal-session', async (req, res) => {
+    if (!ensureStripe(res)) return;
+    const body = await readJsonBody(req);
+    if (!body) return res.status(400).json({ error: 'invalid_json' });
+    const { customerId, uid } = body;
+    if (!customerId) return res.status(400).json({ error: 'No active subscription found.' });
+    if (!uid) return res.status(400).json({ error: 'uid is required' });
+
+    const params = new URLSearchParams();
+    params.append('customer', customerId);
+    params.append('return_url', `${PUBLIC_BASE_URL}/?stripe=portal-return`);
+
+    try {
+      const r = await fetch('https://api.stripe.com/v1/billing_portal/sessions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: params,
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        console.warn('[stripe←] create-portal-session', r.status, data?.error?.message);
+        return res.status(r.status).json({ error: data?.error?.message || `Stripe ${r.status}` });
+      }
+      res.json({ url: data.url });
+    } catch (err) {
+      res.status(500).json({ error: String(err?.message || err) });
+    }
+  });
+
+  app.get('/api/stripe/verify-session', async (req, res) => {
+    if (!ensureStripe(res)) return;
+    const sessionId = String(req.query.session_id || '');
+    const uid = String(req.query.uid || '');
+    if (!sessionId || !uid) return res.status(400).json({ ok: false, error: 'session_id and uid are required' });
+
+    try {
+      const r = await fetch(
+        `https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(sessionId)}?expand[]=subscription`,
+        { headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}` } },
+      );
+      const session = await r.json().catch(() => ({}));
+      if (!r.ok) return res.status(r.status).json({ ok: false, error: session?.error?.message || `Stripe ${r.status}` });
+
+      if (session.client_reference_id !== uid && session?.metadata?.uid !== uid) {
+        return res.status(403).json({ ok: false, error: 'Session does not belong to this user.' });
+      }
+      const paid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+      const subStatus = typeof session.subscription === 'object' ? session.subscription?.status : null;
+      const subActive = !subStatus || subStatus === 'active' || subStatus === 'trialing';
+      if (!paid || !subActive) {
+        return res.status(402).json({ ok: false, error: `Payment not completed (status: ${session.payment_status}).` });
+      }
+      res.json({
+        ok: true,
+        planId: session?.metadata?.planId || null,
+        customerId: typeof session.customer === 'string' ? session.customer : session.customer?.id,
+        subscriptionId: typeof session.subscription === 'string' ? session.subscription : session.subscription?.id,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err?.message || err) });
     }
   });
 

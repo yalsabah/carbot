@@ -30,7 +30,23 @@ body {
   -webkit-font-smoothing: antialiased;
   background-color: var(--color-bg);
   color: var(--color-text);
-  transition: background-color 0.2s, color 0.2s;
+}
+
+/* Smooth dark ↔ light transitions.
+   Applied via a class on <html> only DURING a theme toggle (added by
+   ThemeContext for ~250ms, then removed). Keeping the transition off the
+   rest of the time means hover states, button presses, and other normal
+   interactions stay snappy — they don't pick up an unwanted fade.
+   The cascade hits everything except <canvas> (Three.js / 3D viewer
+   uses raw GL state and shouldn't be CSS-animated). */
+.theme-transitioning,
+.theme-transitioning *:not(canvas) {
+  transition:
+    background-color 250ms ease,
+    border-color 250ms ease,
+    color 250ms ease,
+    fill 250ms ease,
+    stroke 250ms ease !important;
 }
 
 /* Scrollbar */

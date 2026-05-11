@@ -741,6 +741,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			glbUrl = null,
 			modelStatus = null,
 			userImages = [], // [{ kind:'image', name, dataUrl }]
+			messageId = null, // assistant-message id; needed for post-hoc add-image
+			sessionId = null,
 		) => {
 			// Replace state cleanly — never carry over a previous report's glbUrl.
 			// Carrying it over caused the previous car's GLB to render briefly while
@@ -757,6 +759,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				glbUrl,
 				modelStatus,
 				userImages,
+				messageId,
+				sessionId,
 			});
 			setShowReportModal(true);
 
@@ -901,6 +905,102 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			}
 		},
 		[updateLastMessage, updateMessage],
+	);
+
+	// Post-hoc "+ Add Image" flow from inside ReportModal. The user opened a
+	// report with no source image (CARFAX-only path, or an old chat where the
+	// images expired) and wants a 3D model. We accept a single File, push it
+	// through the same Tripo3D pipeline that the live analysis uses, and stamp
+	// the new image onto the assistant message so:
+	//   - the right sidebar's FilesPanel picks it up immediately
+	//   - reopening the report later still has the image to render
+	//   - the GLB is persisted to R2 by trim-slug, so future users skip Tripo
+	const handleAddImageToReport = useCallback(
+		async (file) => {
+			if (!file || !activeReport?.report?.vehicle) return;
+
+			// Read the chosen file as both a data URL (for instant preview) and
+			// a base64 payload (Tripo input). Tripo accepts data URLs directly
+			// but we still need the raw base64 + mediaType for our generator.
+			const readDataUrl = () =>
+				new Promise((resolve, reject) => {
+					const r = new FileReader();
+					r.onload = () => resolve(r.result);
+					r.onerror = reject;
+					r.readAsDataURL(file);
+				});
+			let dataUrl;
+			try {
+				dataUrl = await readDataUrl();
+			} catch {
+				return;
+			}
+			const mediaType = file.type || 'image/jpeg';
+			const base64 = String(dataUrl).split(',')[1] || '';
+			const newImage = { kind: 'image', name: file.name || 'vehicle.jpg', dataUrl };
+
+			// 1. Update activeReport state so the modal switches off the CTA
+			//    and into the existing "Generating 3D model…" overlay.
+			setActiveReport((prev) =>
+				prev
+					? {
+							...prev,
+							userImages: [...(prev.userImages || []), newImage],
+							modelStatus: 'Pending',
+						}
+					: prev,
+			);
+
+			// 2. Stamp on the assistant message so RightSidebar's FilesPanel
+			//    surfaces this image alongside any others. The sidebar already
+			//    walks all messages and reads from `_attachments`, so adding
+			//    the entry there is enough for in-session display.
+			const messageId = activeReport.messageId;
+			const sessionId = activeReport.sessionId;
+			if (messageId && sessionId) {
+				updateMessage(sessionId, messageId, {
+					_userImages: [...(activeReport.userImages || []), newImage],
+					_attachments: [
+						...((Array.isArray(activeReport._attachments) && activeReport._attachments) || []),
+						newImage,
+					],
+				});
+			}
+
+			// 3. Background-upload to Firebase Storage so the image survives
+			//    refresh. Same pattern as the original analyze flow. We patch
+			//    `imageUrls` (Firestore-safe HTTPS URL list) onto the message
+			//    once the upload completes; the in-session dataUrl is the
+			//    immediate display path until then.
+			if (user?.uid && sessionId && messageId) {
+				try {
+					const uploaded = await uploadVehicleImages(user.uid, sessionId, [file]);
+					if (uploaded?.length) {
+						updateMessage(sessionId, messageId, {
+							imageUrls: [
+								...((Array.isArray(activeReport.imageUrls) && activeReport.imageUrls) || []),
+								...uploaded,
+							],
+						});
+					}
+				} catch (err) {
+					console.warn('[3d] post-hoc image upload to Storage failed', err);
+				}
+			}
+
+			// 4. Run the Tripo3D pipeline. Same call shape as the live path.
+			startRodinJob(
+				base64,
+				mediaType,
+				`${activeReport.vehicleLabel || 'vehicle'} exterior, realistic car`,
+				activeReport.report.vehicle,
+				null,
+				sessionId || null,
+				messageId || null,
+				[{ base64, mediaType }],
+			);
+		},
+		[activeReport, startRodinJob, updateMessage, user],
 	);
 
 	const runAnalysis = useCallback(
@@ -1271,6 +1371,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 						null,
 						null,
 						userImagesForReport,
+						persistedId || null,
+						sessionId || null,
 					);
 					// Kick off 3D model generation in background. Pass the cost
 					// accumulator + persisted message ID so VinAudit/Tripo costs
@@ -1798,6 +1900,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 											resolvedGlbUrl,
 											m._modelStatus || (resolvedGlbUrl ? "Done" : null),
 											userImages || [],
+											m.id || null,
+											activeSessionId || null,
 										);
 									}}
 									isLast={isLast}
@@ -1917,6 +2021,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					glbUrl={activeReport.glbUrl}
 					modelStatus={activeReport.modelStatus}
 					userImages={activeReport.userImages || []}
+					onAddImage={handleAddImageToReport}
 					isReanalyzing={isAnalyzing}
 					onClose={() => setShowReportModal(false)}
 					onConfirmEdits={(edits) => {

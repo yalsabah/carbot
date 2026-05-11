@@ -13,6 +13,7 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import { useChat } from '../contexts/ChatContext';
 import { useTheme } from '../contexts/ThemeContext';
+import { formatDisplayName } from '../utils/usage';
 
 const COLLAPSED_WIDTH = 56;
 const MIN_WIDTH = 220;
@@ -203,7 +204,9 @@ export default function Sidebar({ onOpenSettings, onOpenAuth, collapsed, onToggl
               {(userDoc?.displayName || user.email || 'U')[0].toUpperCase()}
             </div>
             {!collapsed && (
-              <span className="truncate text-sm">{userDoc?.displayName || user.email}</span>
+              <span className="truncate text-sm">
+                {formatDisplayName(userDoc?.displayName, user.email)}
+              </span>
             )}
           </button>
         ) : (

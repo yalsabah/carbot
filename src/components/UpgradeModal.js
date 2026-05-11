@@ -4,8 +4,17 @@ import { PLANS } from '../utils/usage';
 
 export default function UpgradeModal({ onClose, onSignIn }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className="relative w-full max-w-md rounded-2xl p-6 shadow-2xl" style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div
+        className="relative w-full max-w-md rounded-2xl p-6 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+        style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
+      >
         <button onClick={onClose} className="absolute top-4 right-4 p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10">
           <X size={18} style={{ color: 'var(--color-muted)' }} />
         </button>
