@@ -113,10 +113,6 @@ async function tripoSubmitFromFile(imageBase64, imageMediaType) {
   return tripoCreateTask({ type: 'image_to_model', file: { type: 'jpg', file_token: image_token } });
 }
 
-async function tripoSubmitFromUrl(imageUrl) {
-  return tripoCreateTask({ type: 'image_to_model', file: { type: 'jpg', url: imageUrl } });
-}
-
 async function tripoCreateTask(input) {
   const res = await fetch('/api/tripo/task', {
     method: 'POST',
@@ -149,13 +145,20 @@ async function tripoPoll(taskId) {
   return { status: data?.status, progress: data?.progress ?? 0, glbUrl };
 }
 
-async function fetchVinAuditPhotoUrl(vin) {
+// Fetch a base64-encoded stock photo for a VIN via /api/vinaudit-images.
+// Returns { base64, mediaType } that tripoSubmitFromFile can consume
+// directly, or null if nothing usable came back. Replaces the older
+// shape (which expected an image URL from /api/vinaudit — that endpoint
+// is for market values, not images, and silently always returned null).
+async function fetchVinAuditPhoto(vin) {
   if (!vin) return null;
   try {
-    const res = await fetch(`/api/vinaudit?vin=${encodeURIComponent(vin)}`);
+    const res = await fetch(`/api/vinaudit-images?vin=${encodeURIComponent(vin)}`);
     if (!res.ok) return null;
     const data = await res.json();
-    return data?.images?.[0] ?? null;
+    const first = data?.images?.[0];
+    if (!first?.base64 || !first?.mediaType) return null;
+    return { base64: first.base64, mediaType: first.mediaType };
   } catch {
     return null;
   }
@@ -180,11 +183,15 @@ export async function submit3DJob(imageBase64, imageMediaType, vin) {
     const taskId = await tripoSubmitFromFile(imageBase64, imageMediaType);
     return { taskId, source: 'photo' };
   }
+  // No user-supplied image. Fall back to VinAudit stock photo (charged
+  // per call — see vinAuditImages.js). VinAudit returns base64 directly,
+  // so we feed it through the file path (not the URL path) — no extra
+  // HTTP hop, no CORS concerns.
   if (vin) {
-    const photoUrl = await fetchVinAuditPhotoUrl(vin);
-    if (photoUrl) {
-      const taskId = await tripoSubmitFromUrl(photoUrl);
-      return { taskId, source: 'vinaudit', photoUrl };
+    const stock = await fetchVinAuditPhoto(vin);
+    if (stock) {
+      const taskId = await tripoSubmitFromFile(stock.base64, stock.mediaType);
+      return { taskId, source: 'vinaudit' };
     }
   }
   return null;

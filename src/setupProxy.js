@@ -354,6 +354,47 @@ module.exports = function (app) {
     }
   });
 
+  // VinAudit Vehicle Images — mirrors functions/api/vinaudit-images.js.
+  // Returns base64-encoded images that the Tripo pipeline can feed directly
+  // (no separate URL fetch round-trip). Same env-var fallback as the
+  // market-value endpoint.
+  app.get('/api/vinaudit-images', async (req, res) => {
+    if (!VINAUDIT_KEY) {
+      return res.status(500).json({ error: 'VINAUDIT key not configured (set VINAUDIT_API_KEY in .env)' });
+    }
+    const vin = String(req.query.vin || '').toUpperCase();
+    if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vin)) {
+      return res.status(400).json({ error: 'valid 17-char vin required' });
+    }
+    const params = new URLSearchParams({
+      vin,
+      key: VINAUDIT_KEY,
+      format: 'json',
+      pose: String(req.query.pose || 'front_right'),
+      size: String(req.query.size || 'medium'),
+      color: String(req.query.color || 'white'),
+      granularity: 'trim',
+    });
+    try {
+      const r = await fetch(`https://images.vinaudit.com/v3/images?${params.toString()}`);
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data?.success === false) {
+        console.warn('[vinaudit-images←]', r.status, data?.error);
+        return res.status(r.status >= 400 ? r.status : 502).json({
+          error: data?.error || `VinAudit ${r.status}`,
+        });
+      }
+      const images = Array.isArray(data?.images)
+        ? data.images
+            .filter((i) => i?.data && i?.content_type)
+            .map((i) => ({ base64: i.data, mediaType: i.content_type, source: 'vinaudit' }))
+        : [];
+      res.json({ images, ymmt: data?.ymmt || null });
+    } catch (err) {
+      res.status(502).json({ error: String(err?.message || err) });
+    }
+  });
+
   // VinAudit — server injects key into query string
   app.use(
     '/api/vinaudit',

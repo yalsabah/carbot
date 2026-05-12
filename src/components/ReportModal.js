@@ -590,8 +590,8 @@ function CarImagesPanel({ userImages, vehicle }) {
             No photos available
           </div>
           <div className="text-xs mt-1 max-w-xs" style={{ color: 'var(--color-muted)' }}>
-            Upload one or more vehicle photos with your CARFAX to see them here.
-            VinAudit stock photos will appear automatically once API access is provisioned.
+            Upload one or more vehicle photos with your CARFAX, or VinAudit
+            will surface a stock photo for this trim if one is available.
           </div>
         </div>
       ) : (
