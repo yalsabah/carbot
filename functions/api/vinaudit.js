@@ -1,8 +1,13 @@
 // Cloudflare Pages Function — VinAudit market value lookup by VIN.
-// Holds VINAUDIT_KEY server-side. Returns the upstream JSON verbatim.
+// Holds the VinAudit key server-side. Returns the upstream JSON verbatim.
+//
+// Accepts the key under either VINAUDIT_KEY (legacy) or VINAUDIT_API_KEY
+// (matches what's in the dashboard now). First non-empty wins so existing
+// deployments keep working.
 export async function onRequestGet({ request, env }) {
-  if (!env.VINAUDIT_KEY) {
-    return new Response(JSON.stringify({ error: 'VINAUDIT_KEY not configured' }), {
+  const KEY = env.VINAUDIT_API_KEY || env.VINAUDIT_KEY;
+  if (!KEY) {
+    return new Response(JSON.stringify({ error: 'VINAUDIT key not configured' }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -18,7 +23,7 @@ export async function onRequestGet({ request, env }) {
   }
 
   const upstream = await fetch(
-    `https://marketvalue.vinaudit.com/getmarketvalue.php?key=${env.VINAUDIT_KEY}&vin=${encodeURIComponent(vin)}&format=json`
+    `https://marketvalue.vinaudit.com/getmarketvalue.php?key=${encodeURIComponent(KEY)}&vin=${encodeURIComponent(vin)}&format=json`
   );
   return new Response(upstream.body, {
     status: upstream.status,

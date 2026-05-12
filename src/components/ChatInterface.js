@@ -612,6 +612,41 @@ async function collectHistoryAttachments(messages) {
 	return { carfaxText, images };
 }
 
+// Convert a userImage entry into { base64, mediaType } that the Tripo3D
+// pipeline accepts. Handles both representations of `dataUrl`:
+//   - in-session data: URLs (data:image/jpeg;base64,XXXX) → split the prefix
+//   - Firebase Storage HTTPS URLs (persisted across refresh) → fetch the
+//     blob and re-encode as base64.
+// Returns null if conversion failed (corrupt URL, CORS, network).
+async function userImageToTripoFormat(img) {
+	const url = img?.dataUrl;
+	if (!url) return null;
+	if (url.startsWith("data:")) {
+		const m = /^data:([^;]+);base64,(.+)$/.exec(url);
+		if (!m) return null;
+		return { base64: m[2], mediaType: m[1] };
+	}
+	try {
+		const r = await fetch(url);
+		if (!r.ok) return null;
+		const blob = await r.blob();
+		const mediaType = blob.type || "image/jpeg";
+		const base64 = await new Promise((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = () => {
+				const s = String(reader.result);
+				const idx = s.indexOf(",");
+				resolve(idx >= 0 ? s.slice(idx + 1) : s);
+			};
+			reader.onerror = reject;
+			reader.readAsDataURL(blob);
+		});
+		return { base64, mediaType };
+	} catch {
+		return null;
+	}
+}
+
 // ─── Main ChatInterface ────────────────────────────────────────────────────────
 export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTriggerRef, onCompactingChange }) {
 	const { user, userDoc } = useAuth();
@@ -772,12 +807,71 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			// re-running Tripo3D. Fresh analyses skip this — they have their
 			// own startRodinJob path that handles cache hits there.
 			if (!glbUrl && report?.vehicle) {
-				lookupCachedModel(report.vehicle).then((cached) => {
+				lookupCachedModel(report.vehicle).then(async (cached) => {
 					if (cached?.glbUrl) {
 						setActiveReport((prev) =>
 							prev
 								? { ...prev, glbUrl: cached.glbUrl, modelStatus: "CacheHit" }
 								: prev,
+						);
+						return;
+					}
+					// Cache miss path. Two reasons this happens:
+					//   1. Vehicle was never modeled before (first user on this
+					//      trim, no images persisted) → leave terminal so the
+					//      "+ Add Image of Vehicle" CTA renders.
+					//   2. Slug doc exists but the Tripo URL expired (~24h
+					//      CloudFront signature) — and we have the user's
+					//      original photo cached. Quietly regenerate so the
+					//      modal flips from infinite "Generating 3D model…"
+					//      into a real, fresh render. New GLB lands in R2
+					//      and the cache works again for every future user.
+					const haveImage =
+						Array.isArray(userImages) && userImages.length > 0;
+					const haveVin = !!report?.vehicle?.vin;
+
+					// If we have neither a user image NOR a VIN to fall back
+					// to VinAudit, there's no input source for Tripo at all
+					// — flip to Failed so the "+ Add Image" CTA renders.
+					if (!haveImage && !haveVin) {
+						setActiveReport((prev) =>
+							prev ? { ...prev, modelStatus: "Failed" } : prev,
+						);
+						return;
+					}
+
+					// If we have a user image, convert it to Tripo's input
+					// shape. If we only have a VIN, submit3DJob will handle
+					// the VinAudit lookup internally.
+					let tripoImg = null;
+					if (haveImage) {
+						tripoImg = await userImageToTripoFormat(userImages[0]);
+						if (!tripoImg && !haveVin) {
+							setActiveReport((prev) =>
+								prev ? { ...prev, modelStatus: "Failed" } : prev,
+							);
+							return;
+						}
+					}
+
+					// Move to a non-terminal status so the existing
+					// "Generating 3D model…" overlay is meaningful (a real
+					// job is now running underneath it).
+					setActiveReport((prev) =>
+						prev ? { ...prev, modelStatus: "Pending" } : prev,
+					);
+
+					const fn = startRodinJobRef.current;
+					if (typeof fn === "function") {
+						fn(
+							tripoImg?.base64 || null,
+							tripoImg?.mediaType || null,
+							`${vehicleLabel || "vehicle"} exterior, realistic car`,
+							report.vehicle,
+							null,
+							sessionId || null,
+							messageId || null,
+							tripoImg ? [tripoImg] : null,
 						);
 					}
 				});
@@ -785,6 +879,11 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 		},
 		[],
 	);
+
+	// Hold the latest startRodinJob in a ref so openReport (declared above)
+	// can call it without dragging startRodinJob into its deps array —
+	// useCallback ordering would otherwise force this whole block above.
+	const startRodinJobRef = useRef(null);
 
 	// Kick off 3D pipeline. Trim-cache-first via the asset library:
 	//   - If models3d/{slug} is ready in Firestore → instant cache hit, no Tripo cost.
@@ -906,6 +1005,13 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 		},
 		[updateLastMessage, updateMessage],
 	);
+
+	// Keep the ref pointed at the latest startRodinJob so the openReport
+	// cache-miss path (declared above) can call it without a circular
+	// useCallback dependency.
+	useEffect(() => {
+		startRodinJobRef.current = startRodinJob;
+	}, [startRodinJob]);
 
 	// Post-hoc "+ Add Image" flow from inside ReportModal. The user opened a
 	// report with no source image (CARFAX-only path, or an old chat where the

@@ -1,0 +1,21 @@
+[
+  {
+    "_comment": "CORS policy for the Firebase Storage bucket. Applied via gcloud — see README in this directory. Lets the VinCritiq frontend (localhost in dev, vincritiq.com in prod) fetch() vehicle photos. Without this, fetch is blocked even though <img src> still works for display.",
+    "origin": [
+      "http://localhost:3000",
+      "https://vincritiq.com",
+      "https://*.vincritiq.com",
+      "https://carbot-77c32.web.app",
+      "https://carbot-77c32.firebaseapp.com"
+    ],
+    "method": ["GET", "HEAD"],
+    "responseHeader": [
+      "Content-Type",
+      "Content-Length",
+      "Content-Disposition",
+      "Cache-Control",
+      "Access-Control-Allow-Origin"
+    ],
+    "maxAgeSeconds": 3600
+  }
+]
