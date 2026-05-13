@@ -6,6 +6,36 @@ import * as THREE from 'three';
 import VehicleCanvas from './VehicleCanvas';
 import { fetchVinAuditImages } from '../utils/vinAuditImages';
 
+// Local error boundary so a GLB load failure doesn't kill the report
+// modal (or worse, the whole app). When the GLTFLoader throws — usually
+// because a Tripo URL expired, hit CORS, or returned a malformed model
+// — we swap in the procedural VehicleCanvas fallback so the user still
+// sees a 3D silhouette and can keep using the rest of the report.
+class ModelErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { errored: false };
+  }
+  static getDerivedStateFromError() {
+    return { errored: true };
+  }
+  componentDidCatch(error) {
+    // eslint-disable-next-line no-console
+    console.warn('[3d] GLB load failed, falling back to procedural', error?.message || error);
+  }
+  componentDidUpdate(prevProps) {
+    // Reset the boundary when the URL/swatch changes — gives a fresh
+    // model a chance to succeed even if the previous one failed.
+    if (this.state.errored && prevProps.children !== this.props.children) {
+      this.setState({ errored: false });
+    }
+  }
+  render() {
+    if (this.state.errored) return this.props.fallback;
+    return this.props.children;
+  }
+}
+
 const fmt = (n, prefix = '') => {
   if (n == null) return '—';
   if (typeof n === 'string') return n;
@@ -800,9 +830,24 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
         // Tier 1 — AI-generated GLB from Tripo3D, persisted in R2 by trim.
         // Position is computed dynamically inside GLBScene per-model; only
         // the FOV survives across renders (the fit math depends on it).
-        <Canvas camera={{ fov: 38 }} style={{ background: 'transparent' }}>
-          <GLBScene url={glbUrl} swatch={activeSwatch} />
-        </Canvas>
+        //
+        // ModelErrorBoundary catches GLTF load failures (expired Tripo URL,
+        // CORS block, malformed GLB) so a broken model doesn't take down
+        // the rest of the report. On error, falls back to the procedural
+        // VehicleCanvas so the user still sees a 3D-ish silhouette.
+        <ModelErrorBoundary
+          fallback={
+            <VehicleCanvas
+              vehicleColor={vehicleColor}
+              wheelColor={wheelColor || 'gunmetal'}
+              bodyStyle={bodyStyle}
+            />
+          }
+        >
+          <Canvas camera={{ fov: 38 }} style={{ background: 'transparent' }}>
+            <GLBScene url={glbUrl} swatch={activeSwatch} />
+          </Canvas>
+        </ModelErrorBoundary>
       ) : showAddImageCTA ? (
         // Tier 1.5 — No source image was provided AND we're not currently
         // generating, so the procedural blocky-car would be all the user

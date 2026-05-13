@@ -931,20 +931,48 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				}
 				if (isDev) console.log("%c[3d]", "color:#2563eb;font-weight:bold", "startRodinJob got result", result);
 				if (result?.glbUrl) {
-					setActiveReport((prev) => {
-						if (!prev) {
-							if (isDev) console.log("%c[3d]", "color:#dc2626;font-weight:bold", "activeReport is null — modal closed before GLB landed; will still stamp on message so reopen works");
-							return prev;
-						}
-						return { ...prev, glbUrl: result.glbUrl, modelStatus: "Done" };
-					});
-					// In-memory always: lets close-and-reopen of the modal in the
-					// CURRENT session keep showing the GLB without re-fetching.
-					updateLastMessage((prev) => ({
-						...prev,
-						_glbUrl: result.glbUrl,
-						_modelStatus: "Done",
-					}));
+					// CRITICAL: in production, never hand a raw Tripo CDN URL
+					// to the renderer. Tripo's CDN sends no Access-Control-
+					// Allow-Origin header, so Three.js's GLTFLoader hits a
+					// CORS block when it tries to fetch — and an uncaught
+					// fetch throw from inside the Canvas takes the whole
+					// React tree down (white screen). In dev we proxy
+					// through /dev-glb-proxy so the URL is same-origin and
+					// safe; in prod R2 must serve the GLB instead.
+					//
+					// If we got here in prod with a Tripo URL, R2 is
+					// misconfigured (MODELS_PUBLIC_BASE not set). Mark the
+					// model as failed instead of rendering — user sees the
+					// procedural fallback / "+ Add Image" CTA rather than
+					// a crash.
+					const isTripoUrl = /tripo3d\.com\//.test(result.glbUrl);
+					const isProxied = result.glbUrl.startsWith('/dev-glb-proxy');
+					const safeToRender = isProxied || !isTripoUrl;
+
+					if (!safeToRender) {
+						console.warn(
+							'[3d] Refusing to render raw Tripo URL in production (would CORS-fail). R2 is likely misconfigured — set MODELS_PUBLIC_BASE in Cloudflare Pages env.',
+						);
+						setActiveReport((prev) =>
+							prev ? { ...prev, modelStatus: 'Failed' } : prev,
+						);
+						updateLastMessage((prev) => ({ ...prev, _modelStatus: 'Failed' }));
+					} else {
+						setActiveReport((prev) => {
+							if (!prev) {
+								if (isDev) console.log("%c[3d]", "color:#dc2626;font-weight:bold", "activeReport is null — modal closed before GLB landed; will still stamp on message so reopen works");
+								return prev;
+							}
+							return { ...prev, glbUrl: result.glbUrl, modelStatus: "Done" };
+						});
+						// In-memory always: lets close-and-reopen of the modal in the
+						// CURRENT session keep showing the GLB without re-fetching.
+						updateLastMessage((prev) => ({
+							...prev,
+							_glbUrl: result.glbUrl,
+							_modelStatus: "Done",
+						}));
+					}
 
 					// What we persist to Firestore depends on the URL origin:
 					//
@@ -962,8 +990,9 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					//     mean R2 is misconfigured (MODELS_PUBLIC_BASE missing)
 					//     and persisting a no-CORS URL guarantees the modal
 					//     hard-errors on refresh.
-					const isTripoCdn = /tripo3d\.com\//.test(result.glbUrl);
-					const isProxied = result.glbUrl.startsWith('/dev-glb-proxy');
+					// (isTripoUrl + isProxied already computed above for the
+					// render-safety check — reuse them here for persistence.)
+					const isTripoCdn = isTripoUrl;
 					// In dev, result.glbUrl is the proxied form; recover the raw
 					// Tripo URL out of it for persistence.
 					const rawUrl = isProxied

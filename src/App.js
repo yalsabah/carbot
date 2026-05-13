@@ -13,6 +13,7 @@ import RightSidebar from './components/RightSidebar';
 import AuthModal from './components/AuthModal';
 import SettingsModal from './components/SettingsModal';
 import UpgradeModal from './components/UpgradeModal';
+import ErrorBoundary from './components/ErrorBoundary';
 
 function AppInner() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -225,13 +226,18 @@ function AppInner() {
 }
 
 export default function App() {
+  // ErrorBoundary wraps the entire provider stack so an uncaught throw
+  // (Three.js GLB load failure, Firestore offline race, etc.) shows a
+  // recovery card instead of a white screen.
   return (
-    <ThemeProvider>
-      <AuthProvider>
-        <ChatProvider>
-          <AppInner />
-        </ChatProvider>
-      </AuthProvider>
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider>
+        <AuthProvider>
+          <ChatProvider>
+            <AppInner />
+          </ChatProvider>
+        </AuthProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }
