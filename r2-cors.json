@@ -1,0 +1,15 @@
+[
+  {
+    "_comment": "CORS policy for the R2 bucket that serves vehicle 3D models. Without this, Three.js fetch() from vincritiq.com hits 'No Access-Control-Allow-Origin' and the model fails to load. Apply via gcloud-equivalent: see README in this directory.",
+    "AllowedOrigins": [
+      "http://localhost:3000",
+      "https://vincritiq.com",
+      "https://*.vincritiq.com",
+      "https://*.pages.dev"
+    ],
+    "AllowedMethods": ["GET", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["Content-Length", "Content-Type", "ETag"],
+    "MaxAgeSeconds": 86400
+  }
+]
