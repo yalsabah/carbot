@@ -565,8 +565,16 @@ function CarImagesPanel({ userImages, vehicle }) {
     let abort = false;
     const vin = vehicle?.vin;
     if (!vin) return;
+    // Skip the paid VinAudit lookup ($1/call) when the user already
+    // supplied their own photos. Their photos are more accurate (actual
+    // color, trim, condition) and the stock image adds little. If the L2
+    // Firestore cache happens to have an entry, the in-memory map still
+    // makes it free to fetch — but we don't want to pay for fresh calls.
+    if (Array.isArray(userImages) && userImages.length > 0) return;
     setLoadingVin(true);
-    fetchVinAuditImages(vin)
+    // Pass the parsed vehicle so the cache hits by year-make-model when
+    // available (lets different trims share a single VinAudit fetch).
+    fetchVinAuditImages(vin, { vehicle })
       .then((imgs) => {
         if (!abort) setVinImages(Array.isArray(imgs) ? imgs : []);
       })
@@ -574,7 +582,11 @@ function CarImagesPanel({ userImages, vehicle }) {
         if (!abort) setLoadingVin(false);
       });
     return () => { abort = true; };
-  }, [vehicle?.vin]);
+    // We intentionally key on the specific vehicle identifier fields,
+    // NOT the whole vehicle object (which is a new reference each render
+    // and would re-fire the effect for no real reason).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vehicle?.vin, vehicle?.year, vehicle?.make, vehicle?.model, userImages?.length]);
 
   const tiles = useMemo(() => {
     const out = [];
@@ -596,6 +608,12 @@ function CarImagesPanel({ userImages, vehicle }) {
       if (tiles.length === 0) return;
       if (e.key === 'Escape') {
         e.preventDefault();
+        // The parent ReportModal also has a window-level Escape handler
+        // (registered in bubble phase). Without stopImmediatePropagation
+        // here, pressing Escape closes BOTH the lightbox AND the modal in
+        // one keystroke. We register in capture phase + stop immediately
+        // so the modal's listener never sees the event.
+        e.stopImmediatePropagation();
         setLightboxIndex(null);
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
@@ -605,14 +623,27 @@ function CarImagesPanel({ userImages, vehicle }) {
         setLightboxIndex((i) => (i == null ? 0 : (i - 1 + tiles.length) % tiles.length));
       }
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    // Capture phase: fires before the bubble-phase modal handler.
+    window.addEventListener('keydown', handler, true);
+    return () => window.removeEventListener('keydown', handler, true);
   }, [lightboxIndex, tiles.length]);
 
   const empty = tiles.length === 0 && !loadingVin;
 
   return (
-    <div className="absolute inset-0 overflow-y-auto" style={{ padding: 16, paddingBottom: 220 }}>
+    <div
+      className="absolute inset-0 overflow-y-auto"
+      style={{
+        padding: 12,
+        // Clear the floating ViewTabs pill (sits at top: 12, ~36px tall).
+        // The extra ~24px gives visual breathing room between the tab row
+        // and the first image.
+        paddingTop: 72,
+        // Reserve bottom space for the vehicle-info gradient overlay so the
+        // first image's lower edge isn't permanently hidden behind it.
+        paddingBottom: 200,
+      }}
+    >
       {empty ? (
         <div className="h-full flex flex-col items-center justify-center text-center px-6" style={{ minHeight: '60%' }}>
           <ImageIcon size={36} style={{ color: 'var(--color-muted)', opacity: 0.5 }} />
@@ -625,14 +656,19 @@ function CarImagesPanel({ userImages, vehicle }) {
           </div>
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-2">
+        // Stack images vertically, full panel width, 4:3 aspect. Scrolls
+        // when there are more photos than fit. The first photo's lower
+        // edge clears the vehicle-info gradient (handled by paddingBottom
+        // above), so the whole car is visible above the fade.
+        <div className="flex flex-col gap-2">
           {tiles.map((t, i) => (
             <button
               key={i}
               onClick={() => setLightboxIndex(i)}
               title={t.label}
-              className="relative rounded-xl overflow-hidden transition-transform hover:scale-[1.02]"
+              className="relative rounded-xl overflow-hidden transition-transform hover:scale-[1.01]"
               style={{
+                width: '100%',
                 aspectRatio: '4 / 3',
                 border: '1px solid var(--color-border)',
                 background: 'var(--color-bg)',
@@ -647,7 +683,7 @@ function CarImagesPanel({ userImages, vehicle }) {
               />
               {t.source === 'vinaudit' && (
                 <span
-                  className="absolute top-1.5 left-1.5 text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full"
+                  className="absolute top-2 left-2 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full"
                   style={{ background: 'rgba(0,0,0,0.7)', color: '#fff' }}
                 >
                   VinAudit
@@ -659,6 +695,7 @@ function CarImagesPanel({ userImages, vehicle }) {
             <div
               className="rounded-xl flex items-center justify-center text-xs"
               style={{
+                width: '100%',
                 aspectRatio: '4 / 3',
                 border: '1px dashed var(--color-border)',
                 color: 'var(--color-muted)',
@@ -778,6 +815,19 @@ function ViewTabs({ active, onChange, modelStatus }) {
       })}
     </div>
   );
+}
+
+// Map the internal provider id to a short human label for the corner badge.
+// Kept tiny — this is purely a diagnostic for the developer (and a confidence
+// signal for the user that the model isn't procedural).
+function formatProviderLabel(modelProvider) {
+  if (!modelProvider) return null;
+  switch (modelProvider) {
+    case 'replicate-trellis': return 'Replicate · TRELLIS';
+    case 'nvidia-trellis':    return 'NVIDIA · TRELLIS';
+    case 'tripo':             return 'Tripo3D';
+    default:                  return modelProvider;
+  }
 }
 
 function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect, activeTab, userImages, onAddImage }) {
@@ -904,6 +954,7 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
         <ColorSwatchRow activeId={activeColorId} onSelect={onColorSelect} />
       )}
 
+
       {/* When the GLB is still being generated and the user is looking at the
           3D Model tab, show a prominent centered "creating" message with the
           pulsing dots — much more visible than the small top-left pill. The
@@ -977,7 +1028,7 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
   );
 }
 
-export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, userImages = [], onAddImage, onClose, onConfirmEdits, isReanalyzing }) {
+export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, modelProvider, userImages = [], onAddImage, onClose, onConfirmEdits, isReanalyzing }) {
   const [exiting, setExiting] = useState(false);
   const closeTimer = useRef(null);
   // Color picker state. Seeded from the CARFAX/decoded color when possible so
@@ -1047,7 +1098,28 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
             {vehicle?.trim && <div className="text-sm mt-0.5" style={{ color: 'var(--color-muted)' }}>{vehicle.trim}</div>}
             {vehicle?.mileage && <div className="text-sm mt-1" style={{ color: 'var(--color-muted)', opacity: 0.8 }}>{vehicle.mileage.toLocaleString()} miles</div>}
             <div className="mt-3">{verdict?.rating && <VerdictBadge rating={verdict.rating} large />}</div>
-            <p className="text-xs mt-2" style={{ color: 'var(--color-muted)', opacity: 0.7 }}>Drag to rotate · auto-spins</p>
+            <div className="flex items-end justify-between gap-2 mt-2">
+              <p className="text-xs" style={{ color: 'var(--color-muted)', opacity: 0.7 }}>Drag to rotate · auto-spins</p>
+              {/* Subtle provider attribution — only shown on 3D Model tab
+                  with a real GLB loaded. Helps tell Tripo3D vs Replicate
+                  TRELLIS output apart at a glance. */}
+              {glbUrl && activeTab === 'model' && formatProviderLabel(modelProvider) && (
+                <span
+                  className="select-none"
+                  style={{
+                    fontSize: 10,
+                    letterSpacing: '0.04em',
+                    fontWeight: 500,
+                    color: 'var(--color-muted)',
+                    opacity: 0.45,
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {formatProviderLabel(modelProvider)}
+                </span>
+              )}
+            </div>
           </div>
         </div>
 

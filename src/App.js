@@ -9,7 +9,7 @@ import { Loader2 } from 'lucide-react';
 import { ChatProvider, useChat } from './contexts/ChatContext';
 import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
-import RightSidebar from './components/RightSidebar';
+import SessionInfoButton from './components/SessionInfoButton';
 import AuthModal from './components/AuthModal';
 import SettingsModal from './components/SettingsModal';
 import UpgradeModal from './components/UpgradeModal';
@@ -17,7 +17,9 @@ import ErrorBoundary from './components/ErrorBoundary';
 
 function AppInner() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(false);
+  // rightSidebarCollapsed state retired — the right panel is now a
+  // top-right "Session Info" dropdown (SessionInfoButton). The dropdown
+  // owns its own open/close state internally.
   const [showAuth, setShowAuth] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showUpgrade, setShowUpgrade] = useState(false);
@@ -162,10 +164,8 @@ function AppInner() {
         />
       </div>
 
-      <RightSidebar
+      <SessionInfoButton
         messages={messages}
-        collapsed={rightSidebarCollapsed}
-        onToggle={() => setRightSidebarCollapsed((c) => !c)}
         onPreviewImage={(url) => setPreviewImage(url)}
         onCompact={() => compactTriggerRef.current && compactTriggerRef.current()}
         isCompacting={isCompacting}

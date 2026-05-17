@@ -9,22 +9,52 @@ import { useAuth } from './AuthContext';
 const ChatContext = createContext(null);
 export const useChat = () => useContext(ChatContext);
 
+// The app supports multiple analysis modes (Buy a Car / Sell a Car / Find Me
+// a Car). Each session is tagged with a `mode` so the sidebar can show only
+// chats from the current tab. Legacy sessions without a mode field default to
+// 'buy' on read (preserving back-compat with anything created before the
+// feature shipped).
+export const MODES = ['buy', 'sell', 'find'];
+const DEFAULT_MODE = 'buy';
+const ACTIVE_MODE_KEY = 'vincritiq_active_mode';
+
 export function ChatProvider({ children }) {
   const { user } = useAuth();
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
+  // Active mode — controls which tab is showing AND which mode new sessions
+  // get tagged with. Survives reload via localStorage so the user returns to
+  // the tab they were on.
+  const [activeMode, setActiveModeState] = useState(() => {
+    try {
+      const saved = localStorage.getItem(ACTIVE_MODE_KEY);
+      return MODES.includes(saved) ? saved : DEFAULT_MODE;
+    } catch {
+      return DEFAULT_MODE;
+    }
+  });
   const autoResumedRef = useRef(false);
+
+  const setActiveMode = useCallback((mode) => {
+    if (!MODES.includes(mode)) return;
+    setActiveModeState(mode);
+    try { localStorage.setItem(ACTIVE_MODE_KEY, mode); } catch {}
+  }, []);
 
   // Reset auto-resume on sign-out/user switch so a subsequent sign-in resumes correctly.
   useEffect(() => {
     if (!user) autoResumedRef.current = false;
   }, [user]);
 
-  const createSession = useCallback(async (title = 'New Assessment') => {
+  const createSession = useCallback(async (title = 'New Assessment', modeOverride = null) => {
+    // Mode tag: use explicit override if given, otherwise inherit from the
+    // active tab. Buy is the back-compat default for anywhere that doesn't
+    // pass one through.
+    const sessionMode = MODES.includes(modeOverride) ? modeOverride : activeMode;
     const localId = `local-${Date.now()}`;
-    const newSession = { id: localId, title };
+    const newSession = { id: localId, title, mode: sessionMode };
     setSessions(prev => [newSession, ...prev]);
     setActiveSessionId(localId);
     setMessages([]);
@@ -33,10 +63,11 @@ export function ChatProvider({ children }) {
       try {
         const ref = await addDoc(collection(db, 'users', user.uid, 'sessions'), {
           title,
+          mode: sessionMode,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
-        setSessions(prev => prev.map(s => s.id === localId ? { ...s, id: ref.id } : s));
+        setSessions(prev => prev.map(s => s.id === localId ? { ...s, id: ref.id, mode: sessionMode } : s));
         setActiveSessionId(ref.id);
         return ref.id;
       } catch {
@@ -44,7 +75,7 @@ export function ChatProvider({ children }) {
       }
     }
     return localId;
-  }, [user]);
+  }, [user, activeMode]);
 
   const loadSession = useCallback(async (sessionId) => {
     if (!user) return;
@@ -81,18 +112,22 @@ export function ChatProvider({ children }) {
         });
       setSessions(sorted);
 
-      // On first load after sign-in / page refresh, resume the most recent session
-      // so the user lands where they left off instead of a blank new chat.
+      // On first load after sign-in / page refresh, resume the most recent
+      // session of the active mode so the user lands where they left off
+      // (instead of a blank new chat OR a chat from a different tab).
       if (!autoResumedRef.current && sorted.length > 0) {
         autoResumedRef.current = true;
-        await loadSession(sorted[0].id);
+        const recentInMode = sorted.find((s) => (s.mode || DEFAULT_MODE) === activeMode);
+        if (recentInMode) {
+          await loadSession(recentInMode.id);
+        }
       }
     } catch (err) {
       console.error('loadSessions: Firestore read failed', err);
     } finally {
       setLoadingSessions(false);
     }
-  }, [user, loadSession]);
+  }, [user, loadSession, activeMode]);
 
   // Firestore rejects `undefined` values — strip large/ephemeral fields and any undefined entries.
   // Drops: isStreaming (transient), steps (transient UI), _img64/_imgMt (too large for Firestore 1MB doc limit).
@@ -123,7 +158,11 @@ export function ChatProvider({ children }) {
   // Returns null for streaming placeholders, anonymous sessions, local-only
   // sessions, or if the write fails. Callers use the ID to later patch
   // additional fields onto the message (e.g. imageUrl after a Storage upload).
-  const addMessage = useCallback(async (sessionId, message) => {
+  // opts.skipTitleUpdate=true keeps the session title intact even when
+  // a user message is added. Used for re-analyze prompts (which start
+  // with "Re-analyze this deal…" and would otherwise clobber the
+  // vehicle-name title set by the previous analysis).
+  const addMessage = useCallback(async (sessionId, message, opts = {}) => {
     const optimistic = { ...message, id: Date.now().toString() };
     setMessages(prev => [...prev, optimistic]);
 
@@ -136,10 +175,14 @@ export function ChatProvider({ children }) {
           collection(db, 'users', user.uid, 'sessions', sessionId, 'messages'),
           { ...sanitizeForFirestore(message), createdAt: serverTimestamp() }
         );
-        await updateDoc(doc(db, 'users', user.uid, 'sessions', sessionId), {
-          updatedAt: serverTimestamp(),
-          ...(message.role === 'user' && message.text ? { title: message.text.slice(0, 50) } : {}),
-        });
+        const sessionPatch = { updatedAt: serverTimestamp() };
+        if (!opts.skipTitleUpdate && message.role === 'user' && message.text) {
+          sessionPatch.title = message.text.slice(0, 50);
+        }
+        await updateDoc(doc(db, 'users', user.uid, 'sessions', sessionId), sessionPatch);
+        if (sessionPatch.title) {
+          setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: sessionPatch.title } : s));
+        }
         setMessages(prev => prev.map(m => m.id === optimistic.id ? { ...m, id: ref.id } : m));
         return ref.id;
       } catch (err) {
@@ -147,6 +190,27 @@ export function ChatProvider({ children }) {
       }
     }
     return null;
+  }, [user]);
+
+  // Rename a session — used after a successful analysis to update the
+  // sidebar title from the raw user-typed text (e.g. "VIN: 1HGCM82633A...")
+  // to the parsed vehicle label (e.g. "2022 AUDI S7"). Idempotent: if the
+  // title hasn't changed, this is a no-op write.
+  const renameSession = useCallback(async (sessionId, title) => {
+    if (!sessionId || !title) return;
+    const cleanTitle = String(title).trim().slice(0, 80);
+    if (!cleanTitle) return;
+    setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: cleanTitle } : s));
+    if (user && !sessionId.startsWith('local-')) {
+      try {
+        await updateDoc(doc(db, 'users', user.uid, 'sessions', sessionId), {
+          title: cleanTitle,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        console.warn('renameSession: Firestore write failed', err);
+      }
+    }
   }, [user]);
 
   // Called after streaming completes to persist the final assistant message.
@@ -316,7 +380,9 @@ export function ChatProvider({ children }) {
       sessions, activeSessionId, messages, loadingSessions,
       loadSessions, createSession, loadSession, addMessage, persistLastMessage,
       updateLastMessage, updateMessage, deleteSession, startNewChat, setMessages,
+      renameSession,
       recordFeedback,
+      activeMode, setActiveMode,
     }}>
       {children}
     </ChatContext.Provider>

@@ -14,7 +14,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { useChat } from "../contexts/ChatContext";
 import { parseReport, streamCarAnalysis } from "../utils/claudeApi";
-import { generateOrFetch3D, lookupCachedModel } from "../utils/model3d";
+import { generateOrFetch3D, lookupCachedModel, buildModelSlug } from "../utils/model3d";
 import { uploadVehicleImages } from "../utils/imageStorage";
 import { compressImageFiles } from "../utils/imageCompress";
 import { createCostAccumulator, FIXED_COSTS } from "../utils/pricing";
@@ -35,6 +35,8 @@ import {
 } from "../utils/usage";
 import ContextModal from "./ContextModal";
 import ReportModal from "./ReportModal";
+import SellReportModal from "./SellReportModal";
+import ModeTabs from "./ModeTabs";
 import ThinkingPanel from "./ThinkingPanel";
 import UploadArea from "./UploadArea";
 
@@ -172,6 +174,26 @@ function MiniVerdict({ rating }) {
 
 const USER_MSG_COLLAPSE_THRESHOLD = 400;
 
+// Build a sidebar-friendly session title from a parsed report's vehicle
+// block — e.g. { year: 2022, make: "AUDI", model: "S7" } → "2022 AUDI S7".
+// Returns null if the vehicle block doesn't have enough info to be
+// meaningful (in which case we leave the existing title alone).
+//
+// We deliberately preserve the make/model casing Claude returns. Some
+// brands are acronyms (BMW, GMC, VW) where title-casing would mangle
+// them; trying to detect those is fragile, so we just trust the input.
+// Trim is omitted to keep the sidebar entry short.
+function buildSessionTitleFromReport(report) {
+  const v = report?.vehicle;
+  if (!v) return null;
+  const parts = [];
+  if (v.year) parts.push(String(v.year));
+  if (v.make) parts.push(String(v.make).trim());
+  if (v.model) parts.push(String(v.model).trim());
+  const title = parts.join(' ').trim();
+  return title.length >= 4 ? title : null; // need at least year + something
+}
+
 // True when regenerating the assistant response would replay all the same
 // inputs the user originally provided. Files (images, PDFs) aren't persisted
 // across page reloads, so a session loaded from the sidebar has the file
@@ -217,6 +239,14 @@ function MessageBubble({
 	const cleanText = textContent
 		.replace(/<REPORT>[\s\S]*?<\/REPORT>/g, "")
 		.replace(/<REPORT>[\s\S]*$/, "") // hide partial <REPORT> block while streaming
+		// Strip the legacy "Used images: …" footer Claude sometimes still emits
+		// from prompt-cache hits. The UI shows attached photos already, so the
+		// line is pure noise.
+		.replace(/^\s*Used images:[^\n]*\n?/gim, "")
+		.replace(/^\s*Images reviewed:[^\n]*\n?/gim, "")
+		// Collapse 3+ consecutive newlines to a single blank-line separator so
+		// the model can't leave a giant gap between paragraphs.
+		.replace(/\n{3,}/g, "\n\n")
 		.trim();
 
 	const startEdit = () => {
@@ -660,6 +690,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 		updateMessage,
 		setMessages,
 		recordFeedback,
+		activeMode,
+		renameSession,
 	} = useChat();
 	const [input, setInput] = useState("");
 	const [carfaxFile, setCarfaxFile] = useState(null);
@@ -673,9 +705,129 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 	const [showContextModal, setShowContextModal] = useState(false);
 	const [activeReport, setActiveReport] = useState(null);
 	const [showReportModal, setShowReportModal] = useState(false);
+	// Ref-mirrored activeReport so callbacks (openReport, etc.) can read
+	// the latest value without depending on activeReport in their dep
+	// arrays — that would cause them to be recreated on every render and
+	// invalidate the useCallback contracts elsewhere.
+	const activeReportRef = useRef(null);
+	useEffect(() => {
+		activeReportRef.current = activeReport;
+	}, [activeReport]);
+
+	// Last-known set of user-uploaded vehicle photos for the active session,
+	// keyed by sessionId. We push to this every time `runAnalysis` runs with
+	// new image attachments, AND read from it on followup turns that don't
+	// re-upload (e.g. "It has 15k miles"). This is the single source of truth
+	// for "what photos did the user attach to this conversation" so the
+	// follow-up's report modal can keep showing them. Bypasses the fragile
+	// message-walk and activeReport-ref lookups that broke after state churn.
+	const sessionUserImagesRef = useRef({ sessionId: null, images: [] });
 	const rodinAbort = useRef(null);
 	const bottomRef = useRef(null);
 	const textareaRef = useRef(null);
+
+	// "Same vehicle?" identity check for followup turns. Compares by VIN
+	// first (most reliable — survives Claude rewording the trim string),
+	// then by year+make+model as a fallback when VIN is unknown. Slug is
+	// NOT a reliable signal because Claude often varies the trim text turn
+	// to turn ("Sportback Quattro Premium Plus 45 TFSI" → "Sportback 3.0T
+	// Quattro Premium Plus" for the same exact VIN).
+	const isSameVehicleAsActive = useCallback((newVehicle) => {
+		const prev = activeReportRef.current?.report?.vehicle;
+		if (!newVehicle || !prev) return false;
+		const newVin = (newVehicle.vin || "").toUpperCase();
+		const prevVin = (prev.vin || "").toUpperCase();
+		if (newVin && prevVin && newVin !== "UNKNOWN" && prevVin !== "UNKNOWN") {
+			return newVin === prevVin;
+		}
+		const norm = (s) => String(s || "").trim().toLowerCase();
+		return (
+			!!newVehicle.year &&
+			String(newVehicle.year) === String(prev.year) &&
+			!!newVehicle.make &&
+			norm(newVehicle.make) === norm(prev.make) &&
+			!!newVehicle.model &&
+			norm(newVehicle.model) === norm(prev.model)
+		);
+	}, []);
+
+	// Resolve the "carry-over" context for a freshly-parsed followup report.
+	// Returns the user photos, glbUrl, modelStatus, and modelProvider to thread
+	// into openReport so the modal keeps showing the SAME car the user has been
+	// discussing — without regenerating 3D or losing uploaded photos. Used by
+	// BOTH analysis paths (runAnalysis with images, handleSend text-only).
+	const resolveFollowupContext = useCallback((newReport, sessionId, newAttachments = []) => {
+		const newVehicle = newReport?.vehicle || null;
+		const sameVehicle = isSameVehicleAsActive(newVehicle);
+		const prev = activeReportRef.current;
+
+		// Photos: prefer this turn's new attachments. If none, inherit from
+		// the prior report (same vehicle) → session-ref cache → message
+		// walk-back. Slug guard on session-ref prevents cross-vehicle leakage.
+		let userImages = (newAttachments || []).filter(
+			(a) => a?.kind === "image" && a?.dataUrl,
+		);
+		const newVin = (newVehicle?.vin || "").toUpperCase();
+		if (userImages.length === 0 && sameVehicle && Array.isArray(prev?.userImages) && prev.userImages.length > 0) {
+			userImages = prev.userImages;
+		}
+		if (
+			userImages.length === 0 &&
+			sessionUserImagesRef.current?.sessionId === sessionId &&
+			Array.isArray(sessionUserImagesRef.current.images) &&
+			sessionUserImagesRef.current.images.length > 0 &&
+			// Allow if the ref has no VIN tag yet, OR if the VIN matches.
+			(!sessionUserImagesRef.current.vin || sessionUserImagesRef.current.vin === newVin || sameVehicle)
+		) {
+			userImages = sessionUserImagesRef.current.images;
+		}
+		if (userImages.length === 0) {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const m = messages[i];
+				if (m.role === "assistant" && Array.isArray(m._userImages) && m._userImages.length > 0) {
+					userImages = m._userImages;
+					break;
+				}
+				if (m.role === "user" && Array.isArray(m._attachments)) {
+					const imgs = m._attachments.filter((a) => a.kind === "image" && a.dataUrl);
+					if (imgs.length > 0) {
+						userImages = imgs;
+						break;
+					}
+				}
+				if (m.role === "user" && Array.isArray(m.imageUrls) && m.imageUrls.length > 0) {
+					userImages = m.imageUrls.map((u) => ({ kind: "image", name: u.name, dataUrl: u.url }));
+					break;
+				}
+			}
+		}
+
+		// Cache for next followup. Tag with VIN (not slug) so trim drift
+		// across turns doesn't invalidate the cache.
+		if (userImages.length > 0) {
+			sessionUserImagesRef.current = {
+				sessionId,
+				vin: newVin || null,
+				images: userImages,
+			};
+		}
+
+		// 3D model + provider: only inherit when same vehicle. Otherwise
+		// the report is about a different car and needs its own 3D.
+		const inheritedGlbUrl = sameVehicle ? prev?.glbUrl || null : null;
+		const inheritedModelStatus = sameVehicle ? prev?.modelStatus || null : null;
+		const inheritedModelProvider = sameVehicle ? prev?.modelProvider || null : null;
+		const reuse3DModel = sameVehicle && !!inheritedGlbUrl;
+
+		return {
+			sameVehicle,
+			userImages,
+			inheritedGlbUrl,
+			inheritedModelStatus,
+			inheritedModelProvider,
+			reuse3DModel,
+		};
+	}, [messages, isSameVehicleAsActive]);
 
 	useEffect(() => {
 		bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -778,24 +930,49 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			userImages = [], // [{ kind:'image', name, dataUrl }]
 			messageId = null, // assistant-message id; needed for post-hoc add-image
 			sessionId = null,
+			modelProvider = null,
 		) => {
-			// Replace state cleanly — never carry over a previous report's glbUrl.
-			// Carrying it over caused the previous car's GLB to render briefly while
-			// the new car's 3D was still generating. The cache lookup below (and
-			// startRodinJob's onProgress callback) re-populates glbUrl as soon as
-			// it's available, so a brief procedural fallback flash on switch is
-			// the right behavior.
+			// Replace state cleanly — but PRESERVE the existing glbUrl when
+			// the user is reopening the same vehicle they just viewed. Without
+			// this preservation, closing + reopening a report (which is a no-op
+			// from the user's perspective) was triggering the cache-rehydration
+			// path below + the auto-regen fallback, even when the in-memory
+			// glbUrl was perfectly valid for the same slug.
+			//
+			// When the vehicle is DIFFERENT, we still reset to null so the
+			// previous car's GLB doesn't render briefly while the new car's
+			// 3D is generating — that's the original behavior preserved for
+			// the vehicle-switch case.
+			const prevActiveReport = activeReportRef.current;
+			const prevSlug = prevActiveReport?.report?.vehicle
+				? buildModelSlug(prevActiveReport.report.vehicle)
+				: null;
+			const newSlug = report?.vehicle ? buildModelSlug(report.vehicle) : null;
+			const sameVehicle = !!(prevSlug && newSlug && prevSlug === newSlug);
+			const effectiveGlbUrl =
+				glbUrl || (sameVehicle ? prevActiveReport?.glbUrl : null) || null;
+			const effectiveModelStatus =
+				modelStatus || (sameVehicle ? prevActiveReport?.modelStatus : null) || null;
+			const effectiveModelProvider =
+				modelProvider || (sameVehicle ? prevActiveReport?.modelProvider : null) || null;
+
 			setActiveReport({
 				report,
 				vehicleColor,
 				vehicleLabel,
 				imageBase64,
 				imageMediaType,
-				glbUrl,
-				modelStatus,
+				glbUrl: effectiveGlbUrl,
+				modelStatus: effectiveModelStatus,
+				modelProvider: effectiveModelProvider,
 				userImages,
 				messageId,
 				sessionId,
+				// Tag the report with whichever mode the user was in when this
+				// report was produced. SellReportModal vs ReportModal renders
+				// based on this; defaults to 'buy' for back-compat when an old
+				// report (created before this feature) is reopened.
+				mode: activeMode,
 			});
 			setShowReportModal(true);
 
@@ -806,12 +983,20 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			// it's ready, in which case we surface it immediately without
 			// re-running Tripo3D. Fresh analyses skip this — they have their
 			// own startRodinJob path that handles cache hits there.
-			if (!glbUrl && report?.vehicle) {
+			//
+			// Use the *effective* glbUrl here so reopen-same-vehicle skips
+			// the lookup entirely (we already have the model in memory).
+			if (!effectiveGlbUrl && report?.vehicle) {
 				lookupCachedModel(report.vehicle).then(async (cached) => {
 					if (cached?.glbUrl) {
 						setActiveReport((prev) =>
 							prev
-								? { ...prev, glbUrl: cached.glbUrl, modelStatus: "CacheHit" }
+								? {
+									...prev,
+									glbUrl: cached.glbUrl,
+									modelStatus: "CacheHit",
+									modelProvider: cached.modelProvider || prev.modelProvider || null,
+								}
 								: prev,
 						);
 						return;
@@ -877,7 +1062,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				});
 			}
 		},
-		[],
+		[activeMode],
 	);
 
 	// Hold the latest startRodinJob in a ref so openReport (declared above)
@@ -963,7 +1148,12 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 								if (isDev) console.log("%c[3d]", "color:#dc2626;font-weight:bold", "activeReport is null — modal closed before GLB landed; will still stamp on message so reopen works");
 								return prev;
 							}
-							return { ...prev, glbUrl: result.glbUrl, modelStatus: "Done" };
+							return {
+								...prev,
+								glbUrl: result.glbUrl,
+								modelStatus: "Done",
+								modelProvider: result.modelProvider || prev.modelProvider || null,
+							};
 						});
 						// In-memory always: lets close-and-reopen of the modal in the
 						// CURRENT session keep showing the GLB without re-fetching.
@@ -971,6 +1161,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 							...prev,
 							_glbUrl: result.glbUrl,
 							_modelStatus: "Done",
+							_modelProvider: result.modelProvider || prev._modelProvider || null,
 						}));
 					}
 
@@ -1006,6 +1197,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 								glbUrl: rawUrl,
 								glbUrlSource: "tripo",
 								glbUrlExpiresAt: Date.now() + 22 * 60 * 60 * 1000,
+								modelProvider: result.modelProvider || "tripo",
 							};
 							updateLastMessage((prev) => ({ ...prev, ...patch }));
 							updateMessage(sessionId, messageId, patch);
@@ -1017,7 +1209,11 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 						}
 					} else if (!isTripoCdn && !isProxied && sessionId && messageId) {
 						// R2 URL — production happy path.
-						const patch = { glbUrl: result.glbUrl, glbUrlSource: "r2" };
+						const patch = {
+							glbUrl: result.glbUrl,
+							glbUrlSource: "r2",
+							modelProvider: result.modelProvider || null,
+						};
 						updateLastMessage((prev) => ({ ...prev, ...patch }));
 						updateMessage(sessionId, messageId, patch);
 					}
@@ -1139,7 +1335,19 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 	);
 
 	const runAnalysis = useCallback(
-		async (extraText = "") => {
+		async (extraText = "", opts = {}) => {
+			// `keepExistingModel`: when true, the 3D pipeline is skipped entirely
+			// and the previous report's glbUrl + modelStatus are carried into the
+			// new report. Used by "Confirm Edits" / re-analyze flows where the
+			// vehicle hasn't changed — only the financing terms — so regenerating
+			// the model would be wasted work (it would just slug-cache-hit anyway,
+			// but this also avoids a "Generating 3D model…" flash, preserves the
+			// user's chosen body color, and saves one Firestore round trip).
+			const {
+				keepExistingModel = false,
+				existingGlbUrl = null,
+				existingModelStatus = null,
+			} = opts;
 			setShowContextModal(false);
 			setIsAnalyzing(true);
 
@@ -1229,17 +1437,25 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				}
 			}
 
-			const userMessageId = await addMessage(sessionId, {
-				role: "user",
-				text: userText,
-				files: userFiles,
-				// `carfaxText` (no underscore) — persisted to Firestore so
-				// follow-up turns / regenerates can re-include the document
-				// after a refresh. Typical sizes are 5-15KB; well under the
-				// Firestore 1MB-per-doc limit.
-				carfaxText: userCarfaxText || null,
-				_attachments: userAttachments,
-			});
+			const userMessageId = await addMessage(
+				sessionId,
+				{
+					role: "user",
+					text: userText,
+					files: userFiles,
+					// `carfaxText` (no underscore) — persisted to Firestore so
+					// follow-up turns / regenerates can re-include the document
+					// after a refresh. Typical sizes are 5-15KB; well under the
+					// Firestore 1MB-per-doc limit.
+					carfaxText: userCarfaxText || null,
+					_attachments: userAttachments,
+				},
+				// Re-analyze prompts ("Re-analyze this deal with these
+				// financing terms…") would otherwise clobber the session
+				// title set by the first analysis. Skip the title update
+				// on re-analyze so the sidebar keeps showing the vehicle name.
+				{ skipTitleUpdate: keepExistingModel },
+			);
 
 			// Background-upload the vehicle photos to Firebase Storage so they
 			// survive a page refresh / chat-switch round-trip. The user message
@@ -1396,6 +1612,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					messages: [...messages, { role: "user", text: userText }],
 					userMemory: buildUserMemory(),
 					vinDecode: vinDecodeBlock,
+					mode: activeMode,
 				});
 
 				let streamStarted = false;
@@ -1441,6 +1658,13 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 						steps.length - 1,
 						`Analysis complete · ${charCount} chars · verdict: ${report.verdict?.rating || "—"}`,
 					);
+					// Rename the session to the vehicle label so the sidebar
+					// shows "2022 AUDI S7" instead of the raw user prompt
+					// (VIN, free text, etc.). Idempotent on re-analyze.
+					const vehicleTitle = buildSessionTitleFromReport(report);
+					if (vehicleTitle && sessionId) {
+						renameSession(sessionId, vehicleTitle);
+					}
 					if (report.vehicle?.vin) {
 						pushStep(
 							`VIN decoded: ${report.vehicle.vin} → ${report.vehicle.year} ${report.vehicle.make} ${report.vehicle.model}`,
@@ -1481,13 +1705,21 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					const label =
 						`${report.vehicle?.year || ""} ${report.vehicle?.make || ""} ${report.vehicle?.model || ""}`.trim();
 					const vLabel = label || "Vehicle Assessment";
-					// Pass user-uploaded photos (as { name, dataUrl }) into the modal
-					// so the new "Car Images" tab can show them. Each entry is
-					// data-URL-encoded so the report still renders if the user
-					// swaps the underlying File reference.
-					const userImagesForReport = userAttachments.filter(
-						(a) => a.kind === "image" && a.dataUrl,
-					);
+
+					// Resolve same-vehicle inheritance via the shared helper —
+					// same logic used by handleSend's text-only followup path.
+					const ctx = resolveFollowupContext(report, sessionId, userAttachments);
+					const userImagesForReport = ctx.userImages;
+					// Confirm Edits path forces the prior model to come through
+					// even if VIN drift or vehicle change would otherwise miss.
+					const inheritedGlbUrl = keepExistingModel
+						? existingGlbUrl
+						: ctx.inheritedGlbUrl;
+					const inheritedModelStatus = keepExistingModel
+						? existingModelStatus
+						: ctx.inheritedModelStatus;
+					const inheritedModelProvider = ctx.inheritedModelProvider;
+					const reuse3DModel = keepExistingModel || ctx.reuse3DModel;
 					// Stamp the in-session image data + (later) the glbUrl onto the
 					// assistant message itself, so closing and re-opening the report
 					// preserves both. sanitizeForFirestore strips _-prefixed fields,
@@ -1503,17 +1735,47 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 						vLabel,
 						imageBase64,
 						imageMediaType,
-						null,
-						null,
+						// Preserve the existing 3D model whenever the vehicle hasn't
+						// changed — Confirm Edits, clarifying questions, or any
+						// follow-up that re-streams the same <REPORT> block. Saves
+						// the user a "Generating 3D model…" flash and saves a slug
+						// cache lookup or paid provider call.
+						inheritedGlbUrl,
+						inheritedModelStatus,
 						userImagesForReport,
 						persistedId || null,
 						sessionId || null,
+						inheritedModelProvider,
 					);
-					// Kick off 3D model generation in background. Pass the cost
-					// accumulator + persisted message ID so VinAudit/Tripo costs
-					// land on the same message once they fire.
-					const prompt = `${vLabel} exterior, realistic car`;
-					startRodinJob(imageBase64, imageMediaType, prompt, report.vehicle, cost, sessionId, persistedId, processedImages);
+					// When we're reusing an existing 3D model (same-vehicle follow-up
+					// or Confirm Edits), persist the inherited URL + provider to
+					// Firestore on THIS message. Otherwise startRodinJob would be
+					// the only thing that writes glbUrl, and since we just skipped
+					// it, a page refresh would land on a message with no glbUrl —
+					// which then triggers a fresh 3D generation via lookupCachedModel
+					// when the user reopens. (Trim drift across turns means the
+					// slug cache often misses on followups.)
+					if (reuse3DModel && inheritedGlbUrl && sessionId && persistedId) {
+						const isTripoUrlStr = typeof inheritedGlbUrl === "string" && /tripo3d\.com\//.test(inheritedGlbUrl);
+						const patch = {
+							glbUrl: inheritedGlbUrl,
+							glbUrlSource: isTripoUrlStr ? "tripo" : "r2",
+							modelProvider: inheritedModelProvider || null,
+						};
+						if (isTripoUrlStr) {
+							patch.glbUrlExpiresAt = Date.now() + 22 * 60 * 60 * 1000;
+						}
+						updateLastMessage((prev) => ({ ...prev, ...patch }));
+						updateMessage(sessionId, persistedId, patch);
+					}
+					// Skip the 3D pipeline entirely when we have a usable inherited
+					// model. Otherwise kick it off in the background — the cost
+					// accumulator + persisted message ID get plumbed through so
+					// any VinAudit/Tripo/Replicate costs land on the same message.
+					if (!reuse3DModel) {
+						const prompt = `${vLabel} exterior, realistic car`;
+						startRodinJob(imageBase64, imageMediaType, prompt, report.vehicle, cost, sessionId, persistedId, processedImages);
+					}
 				}
 			} catch (err) {
 				failStep(steps.length - 1, `Failed: ${err.message}`);
@@ -1554,6 +1816,9 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			openReport,
 			startRodinJob,
 			resolveVinDecode,
+			activeMode,
+			renameSession,
+			resolveFollowupContext,
 		],
 	);
 
@@ -1675,6 +1940,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					images: history.images,
 					messages: [...messages, { role: "user", text }],
 					userMemory: buildUserMemory(),
+					mode: activeMode,
 					vinDecode: vinDecodeBlock,
 				});
 				for await (const chunk of stream) {
@@ -1695,7 +1961,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					report,
 					totalCost: costSnapshot,
 				}));
-				persistLastMessage(sessionId, {
+				const persistedId = await persistLastMessage(sessionId, {
 					role: "assistant",
 					text: fullText,
 					report: report || null,
@@ -1704,7 +1970,56 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				if (report) {
 					const label =
 						`${report.vehicle?.year || ""} ${report.vehicle?.make || ""} ${report.vehicle?.model || ""}`.trim();
-					openReport(report, null, label || "Vehicle Assessment");
+					const vLabel = label || "Vehicle Assessment";
+					// Rename session to vehicle label so the sidebar reflects
+					// what this chat is actually about, not the raw user prompt.
+					const vehicleTitle = buildSessionTitleFromReport(report);
+					if (vehicleTitle && sessionId) {
+						renameSession(sessionId, vehicleTitle);
+					}
+					// Critical: text-only followups MUST inherit the prior report's
+					// photos and 3D model when the vehicle is the same. Otherwise
+					// the modal opens with no photos AND openReport's cache-miss
+					// branch fires startRodinJob, generating a redundant model.
+					const ctx = resolveFollowupContext(report, sessionId, []);
+					// Stamp the resolved photos onto the assistant message so
+					// future followups walk back and find them.
+					updateLastMessage((prev) => ({
+						...prev,
+						_userImages: ctx.userImages,
+						_vehicleLabel: vLabel,
+					}));
+					// Persist the inherited glbUrl + modelProvider to Firestore so
+					// after a page refresh the followup message reopens with the
+					// SAME 3D model — instead of slug-missing into a fresh job (the
+					// followup's slug often drifts from the initial due to Claude
+					// rewording the trim).
+					if (ctx.inheritedGlbUrl && sessionId && persistedId) {
+						const isTripoUrlStr = typeof ctx.inheritedGlbUrl === "string" && /tripo3d\.com\//.test(ctx.inheritedGlbUrl);
+						const patch = {
+							glbUrl: ctx.inheritedGlbUrl,
+							glbUrlSource: isTripoUrlStr ? "tripo" : "r2",
+							modelProvider: ctx.inheritedModelProvider || null,
+						};
+						if (isTripoUrlStr) {
+							patch.glbUrlExpiresAt = Date.now() + 22 * 60 * 60 * 1000;
+						}
+						updateLastMessage((prev) => ({ ...prev, ...patch }));
+						updateMessage(sessionId, persistedId, patch);
+					}
+					openReport(
+						report,
+						null,
+						vLabel,
+						null,
+						null,
+						ctx.inheritedGlbUrl,
+						ctx.inheritedModelStatus,
+						ctx.userImages,
+						persistedId || null,
+						sessionId || null,
+						ctx.inheritedModelProvider,
+					);
 				}
 			} catch (err) {
 				updateLastMessage((prev) => ({
@@ -1792,6 +2107,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					messages: [...truncated, { role: "user", text: newText }],
 					userMemory: buildUserMemory(),
 					vinDecode: vinDecodeBlock,
+					mode: activeMode,
 				});
 				for await (const chunk of stream) {
 					if (typeof chunk === "string") {
@@ -1820,6 +2136,12 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				if (report) {
 					const label =
 						`${report.vehicle?.year || ""} ${report.vehicle?.make || ""} ${report.vehicle?.model || ""}`.trim();
+					// Rename session to vehicle label so the sidebar reflects
+					// what this chat is actually about, not the raw user prompt.
+					const vehicleTitle = buildSessionTitleFromReport(report);
+					if (vehicleTitle && sessionId) {
+						renameSession(sessionId, vehicleTitle);
+					}
 					openReport(report, null, label || "Vehicle Assessment");
 				}
 			} catch (err) {
@@ -1852,6 +2174,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			setMessages,
 			openReport,
 			resolveVinDecode,
+			activeMode,
+			renameSession,
 		],
 	);
 
@@ -1878,6 +2202,16 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 			className="flex flex-col h-full"
 			style={{ background: "var(--color-bg)" }}
 		>
+			{/* Mode tabs — Buy / Sell / Find. Switches the analysis flow without
+			    reloading the page. Sits above the chat content so the active
+			    selection is always visible. */}
+			<div
+				className="flex-shrink-0 flex items-center justify-center py-3 px-4"
+				style={{ borderBottom: "1px solid var(--color-border)" }}
+			>
+				<ModeTabs />
+			</div>
+
 			{/* Messages */}
 			<div className="flex-1 overflow-y-auto px-4 py-6">
 				{isEmpty ? (
@@ -1889,30 +2223,37 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 							className="text-2xl font-bold mb-2"
 							style={{ color: "var(--color-text)" }}
 						>
-							VinCritiq
+							{activeMode === 'sell' ? 'Sell Your Car' : 'VinCritiq'}
 						</h1>
 						<p
 							className="text-base mb-1"
 							style={{ color: "var(--color-muted)" }}
 						>
-							AI-powered vehicle deal analysis
+							{activeMode === 'sell'
+								? 'Find the best price to sell your vehicle'
+								: 'AI-powered vehicle deal analysis'}
 						</p>
 						<p
 							className="text-sm max-w-md"
 							style={{ color: "var(--color-muted)" }}
 						>
-							Upload a CARFAX PDF and/or a vehicle photo to get a professional
-							assessment — pricing, financing, depreciation, and a deal verdict.
+							{activeMode === 'sell'
+								? "Describe your vehicle (year, make, model, mileage, condition). Add a CARFAX PDF or photos for a more accurate quote. We'll compare prices across private party, trade-in, instant-offer, marketplace, and auction channels."
+								: "Upload a CARFAX PDF and/or a vehicle photo to get a professional assessment — pricing, financing, depreciation, and a deal verdict."}
 						</p>
 						<div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-3 max-w-lg w-full">
-							{[
-								{
-									title: "Deal Rating",
-									desc: "Great / Good / Fair / Bad classification",
-								},
-								{ title: "Price Analysis", desc: "vs. KBB & market average" },
-								{ title: "Depreciation", desc: "1, 3, and 5 year projections" },
-							].map((c) => (
+							{(activeMode === 'sell'
+								? [
+										{ title: 'Best Channel', desc: 'Private party / trade-in / instant / marketplace / auction' },
+										{ title: 'Improvements', desc: 'High-ROI upgrades before listing' },
+										{ title: 'Market Context', desc: 'Demand, days to sell, competition' },
+								  ]
+								: [
+										{ title: 'Deal Rating', desc: 'Great / Good / Fair / Bad classification' },
+										{ title: 'Price Analysis', desc: 'vs. KBB & market average' },
+										{ title: 'Depreciation', desc: '1, 3, and 5 year projections' },
+								  ]
+							).map((c) => (
 								<div
 									key={c.title}
 									className="rounded-xl p-3 text-left"
@@ -1982,6 +2323,11 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 										//      Storage HTTPS URLs — survives refresh / chat-switch)
 										let userImages = Array.isArray(m._userImages) ? m._userImages : null;
 										if (!userImages || userImages.length === 0) {
+											// Walk back through ALL prior user messages — text-only
+											// followups (e.g. "full cash for this vehicle") have no
+											// imageUrls/_attachments, but an earlier turn in the same
+											// chat may have uploaded photos. Don't break after the
+											// first user message; keep searching.
 											const idx = messages.lastIndexOf(m);
 											for (let j = idx - 1; j >= 0; j--) {
 												const prevM = messages[j];
@@ -1994,7 +2340,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 													userImages = prevM.imageUrls.map((u) => ({ kind: "image", name: u.name, dataUrl: u.url }));
 													break;
 												}
-												break;
+												// keep walking — the photos might live on an earlier turn
 											}
 										}
 										// glbUrl resolution:
@@ -2037,6 +2383,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 											userImages || [],
 											m.id || null,
 											activeSessionId || null,
+											m._modelProvider || m.modelProvider || null,
 										);
 									}}
 									isLast={isLast}
@@ -2076,9 +2423,13 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 						}}
 						onKeyDown={handleKey}
 						placeholder={
-							carfaxFile || vehicleImages.length > 0
-								? "Add context (asking price, APR, loan term…) or press Enter to analyze"
-								: "Ask about a vehicle, upload a CARFAX & photos, or paste a screenshot…"
+							activeMode === 'sell'
+								? (carfaxFile || vehicleImages.length > 0
+									? "Add context (mileage, condition, modifications, target sale window…) or press Enter to analyze"
+									: "Describe your vehicle: year/make/model/trim/mileage/condition, upload a CARFAX & photos…")
+								: (carfaxFile || vehicleImages.length > 0
+									? "Add context (asking price, APR, loan term…) or press Enter to analyze"
+									: "Ask about a vehicle, upload a CARFAX & photos, or paste a screenshot…")
 						}
 						rows={1}
 						disabled={isAnalyzing}
@@ -2146,7 +2497,15 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 				</div>
 			)}
 
-			{showReportModal && activeReport && (
+			{showReportModal && activeReport && activeReport.mode === 'sell' && (
+				<SellReportModal
+					report={activeReport.report}
+					vehicleLabel={activeReport.vehicleLabel}
+					onClose={() => setShowReportModal(false)}
+				/>
+			)}
+
+			{showReportModal && activeReport && activeReport.mode !== 'sell' && (
 				<ReportModal
 					report={activeReport.report}
 					vehicleColor={activeReport.vehicleColor}
@@ -2155,6 +2514,7 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					imageMediaType={activeReport.imageMediaType}
 					glbUrl={activeReport.glbUrl}
 					modelStatus={activeReport.modelStatus}
+					modelProvider={activeReport.modelProvider || null}
 					userImages={activeReport.userImages || []}
 					onAddImage={handleAddImageToReport}
 					isReanalyzing={isAnalyzing}
@@ -2170,7 +2530,16 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 							`- Term: ${edits.termMonths} months\n` +
 							`Computed on the client: monthly ≈ $${Math.round(edits.monthly).toLocaleString()}, total interest ≈ $${Math.round(edits.totalInterest).toLocaleString()}, total cost ≈ $${Math.round(edits.totalCost).toLocaleString()}.\n` +
 							`Re-evaluate the deal rating (Great/Good/Fair/Bad) given these terms and the same vehicle. Keep the vehicle, depreciation, and market values the same; only the financing block and verdict should change.`;
-						runAnalysis(msg);
+						// Re-analyze ONLY runs Claude — same vehicle, so the 3D
+						// model is preserved as-is. No regeneration, no slug
+						// cache lookup, no provider call. Snapshot the existing
+						// glbUrl/modelStatus from the open report and hand them
+						// through to the new openReport call inside runAnalysis.
+						runAnalysis(msg, {
+							keepExistingModel: true,
+							existingGlbUrl: activeReport?.glbUrl || null,
+							existingModelStatus: activeReport?.modelStatus || null,
+						});
 					}}
 				/>
 			)}
