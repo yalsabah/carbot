@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { X, Award, DollarSign, BarChart2, TrendingDown, Cpu, RotateCcw, Sliders, RefreshCw, Image as ImageIcon, Box, Plus } from 'lucide-react';
+import { X, Award, DollarSign, BarChart2, TrendingDown, Cpu, RotateCcw, Sliders, RefreshCw, Image as ImageIcon, Box, Plus, Maximize2, Minimize2 } from 'lucide-react';
 import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, useGLTF, Environment } from '@react-three/drei';
 import * as THREE from 'three';
@@ -831,10 +831,56 @@ function formatProviderLabel(modelProvider) {
 }
 
 function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect, activeTab, userImages, onAddImage }) {
-  const showGLB = !!glbUrl;
   const bodyStyle = inferBodyStyle(vehicle);
   const activeSwatch = BODY_COLORS.find(c => c.id === activeColorId) || null;
   const fileInputRef = useRef(null);
+
+  // Preflight the GLB URL with a HEAD request before handing it to
+  // useGLTF. Replicate's signed CDN URLs expire ~1h after generation, and
+  // when they 404 the GLTFLoader rejects asynchronously — which slips
+  // past React's render-time ErrorBoundary and triggers the dev error
+  // overlay. Preflighting lets us catch the failure cleanly and show the
+  // procedural fallback exactly as if the GLB never existed.
+  // States: null = not checked yet (treat as ok and let useGLTF try),
+  // true = reachable, false = 404'd (use procedural fallback).
+  const [glbReachable, setGlbReachable] = useState(null);
+  useEffect(() => {
+    if (!glbUrl) {
+      setGlbReachable(null);
+      return;
+    }
+    // Data URLs never 404 — skip the check.
+    if (glbUrl.startsWith('data:')) {
+      setGlbReachable(true);
+      return;
+    }
+    // Replicate's CDN refuses HEAD/Range-GET cross-origin (no CORS
+    // headers), so a preflight here can't tell "expired" from "blocked"
+    // and would just spew console errors. Trust the upstream expiresAt
+    // check + ErrorBoundary instead — they're already the real defense.
+    if (/replicate\.delivery\//.test(glbUrl)) {
+      setGlbReachable(true);
+      return;
+    }
+    let abort = false;
+    setGlbReachable(null);
+    (async () => {
+      try {
+        let res;
+        try {
+          res = await fetch(glbUrl, { method: 'HEAD' });
+        } catch {
+          res = await fetch(glbUrl, { method: 'GET', headers: { Range: 'bytes=0-15' } });
+        }
+        if (!abort) setGlbReachable(res.ok);
+      } catch {
+        if (!abort) setGlbReachable(false);
+      }
+    })();
+    return () => { abort = true; };
+  }, [glbUrl]);
+
+  const showGLB = !!glbUrl && glbReachable !== false;
 
   // Trigger condition for the "+ Add Image" CTA:
   //   - No GLB rendered yet
@@ -1028,7 +1074,47 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
   );
 }
 
-export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, modelProvider, userImages = [], onAddImage, onClose, onConfirmEdits, isReanalyzing }) {
+export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, modelProvider, userImages = [], onAddImage, onClose, onConfirmEdits, isReanalyzing, layout = 'sideBySide', onChangeLayout, widthPct = 65, onChangeWidthPct, onResizingChange }) {
+  // Two presentations:
+  //   'sideBySide' — anchored to the right (width = widthPct vw), no backdrop.
+  //                  Chat on the left stays interactive so the user can answer
+  //                  Claude's clarifying questions without dismissing the report.
+  //   'full'       — full-viewport modal with blurred backdrop.
+  // Default is sideBySide; user can expand to full via the header toggle.
+  // The transition between modes is a single CSS width animation so the
+  // modal grows/shrinks smoothly rather than snapping between two
+  // position models.
+  const isSide = layout === 'sideBySide';
+  const [isResizing, setIsResizing] = useState(false);
+
+  // Drag-resize the side-by-side modal from its left edge. The width is
+  // owned by the parent (ChatInterface) so the chat's right padding can
+  // track it 1:1 during the drag. We disable the CSS transition mid-drag
+  // (via onResizingChange) so the cursor and edge move together.
+  const startResize = (e) => {
+    if (!isSide || typeof onChangeWidthPct !== 'function') return;
+    e.preventDefault();
+    setIsResizing(true);
+    onResizingChange?.(true);
+    const prevCursor = document.body.style.cursor;
+    const prevSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'ew-resize';
+    document.body.style.userSelect = 'none';
+    const handleMove = (ev) => {
+      const pct = ((window.innerWidth - ev.clientX) / window.innerWidth) * 100;
+      onChangeWidthPct(pct);
+    };
+    const handleUp = () => {
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevSelect;
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+      setIsResizing(false);
+      onResizingChange?.(false);
+    };
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+  };
   const [exiting, setExiting] = useState(false);
   const closeTimer = useRef(null);
   // Color picker state. Seeded from the CARFAX/decoded color when possible so
@@ -1042,7 +1128,9 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
 
   const handleClose = () => {
     setExiting(true);
-    closeTimer.current = setTimeout(onClose, 180);
+    // Side-slide exit is slightly longer than the full-screen fade — wait
+    // for whichever animation is actually playing before unmounting.
+    closeTimer.current = setTimeout(onClose, layout === 'sideBySide' ? 230 : 200);
   };
 
   useEffect(() => () => clearTimeout(closeTimer.current), []);
@@ -1058,15 +1146,70 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
   if (!report) return null;
   const { vehicle, pricing, financing, depreciation, verdict, metrics } = report;
 
+  // Single positioning model: the modal is always anchored to the right
+  // edge with width controlled by `layout` + `widthPct`. Toggling between
+  // sideBySide and full just animates the width property — no class swap,
+  // no remount, no snap.
+  const targetWidth = isSide ? `${widthPct}vw` : '100vw';
+  // Mount animation: slide in from the right via translateX. Once the
+  // class is removed (after the animation finishes), width transitions
+  // take over for any layout toggles.
+  const panelClassName = `fixed top-0 bottom-0 right-0 z-50 ${
+    exiting ? 'modal-side-exit' : 'modal-side-enter'
+  }`;
+  // Width transition is disabled mid-drag so the panel edge tracks the
+  // cursor 1:1 instead of lagging behind.
+  const widthTransition = isResizing
+    ? 'none'
+    : 'width 320ms cubic-bezier(0.22,1,0.36,1), box-shadow 280ms ease';
+
   return (
-    <div
-      className={`fixed inset-0 z-50 flex ${exiting ? 'modal-backdrop-exit' : 'modal-backdrop-enter'}`}
-      style={{ background: 'rgba(0,0,0,0.82)', backdropFilter: 'blur(12px)' }}
-      onClick={(e) => { if (e.target === e.currentTarget) handleClose(); }}
-    >
+    <>
+      {/* Backdrop layer — visible only in full mode. Fades in/out so the
+          transition between layouts doesn't pop. Click-to-close lives here. */}
       <div
-        className={`flex w-full h-full ${exiting ? '' : 'modal-content-enter'}`}
+        className="fixed inset-0 z-40"
+        style={{
+          background: 'rgba(0,0,0,0.82)',
+          backdropFilter: 'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
+          opacity: isSide || exiting ? 0 : 1,
+          pointerEvents: isSide || exiting ? 'none' : 'auto',
+          transition: 'opacity 280ms ease',
+        }}
+        onClick={() => { if (!isSide) handleClose(); }}
+      />
+      <div
+        className={panelClassName}
+        style={{
+          width: targetWidth,
+          background: 'var(--color-bg)',
+          boxShadow: isSide ? '-12px 0 36px rgba(0,0,0,0.45)' : 'none',
+          borderLeft: isSide ? '1px solid var(--color-border)' : 'none',
+          transition: widthTransition,
+        }}
       >
+        {/* Resize handle on the left edge — only in side-by-side. A 6px hit
+            zone that sits slightly outside the modal so it's easy to grab
+            without occluding modal content. */}
+        {isSide && typeof onChangeWidthPct === 'function' && (
+          <div
+            onMouseDown={startResize}
+            title="Drag to resize"
+            className="absolute top-0 bottom-0 z-50"
+            style={{
+              left: -3,
+              width: 6,
+              cursor: 'ew-resize',
+              // Subtle highlight on hover so the affordance is discoverable.
+              background: isResizing ? 'rgba(59,130,246,0.35)' : 'transparent',
+              transition: 'background 120ms ease',
+            }}
+          />
+        )}
+        <div
+          className={`flex w-full h-full ${exiting ? '' : 'modal-content-enter'}`}
+        >
         {/* Left: Vehicle visual — theme-aware (white in light, dark in dark) */}
         <div
           className="relative flex-shrink-0 overflow-hidden"
@@ -1134,9 +1277,28 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
                 </h1>
                 {vehicle?.vin && <p className="text-xs font-mono mt-0.5" style={{ color: 'var(--color-muted)' }}>VIN: {vehicle.vin}</p>}
               </div>
-              <button onClick={handleClose} className="w-9 h-9 rounded-full flex items-center justify-center transition-all hover:opacity-70" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}>
-                <X size={16} style={{ color: 'var(--color-muted)' }} />
-              </button>
+              <div className="flex items-center gap-2">
+                {/* Layout toggle — flip between side-by-side (chat visible)
+                    and full-screen (immersive). Hidden when there's no
+                    onChangeLayout callback, e.g. embedded usage. */}
+                {typeof onChangeLayout === 'function' && (
+                  <button
+                    onClick={() => onChangeLayout(isSide ? 'full' : 'sideBySide')}
+                    title={isSide ? 'Expand to full screen' : 'Collapse to side panel'}
+                    aria-label={isSide ? 'Expand to full screen' : 'Collapse to side panel'}
+                    className="w-9 h-9 rounded-full flex items-center justify-center transition-all hover:opacity-70"
+                    style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}
+                  >
+                    {isSide
+                      ? <Maximize2 size={14} style={{ color: 'var(--color-muted)' }} />
+                      : <Minimize2 size={14} style={{ color: 'var(--color-muted)' }} />
+                    }
+                  </button>
+                )}
+                <button onClick={handleClose} className="w-9 h-9 rounded-full flex items-center justify-center transition-all hover:opacity-70" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}>
+                  <X size={16} style={{ color: 'var(--color-muted)' }} />
+                </button>
+              </div>
             </div>
             {isReanalyzing && (
               <div className="px-6 pb-3 -mt-1 flex items-center gap-2 text-xs font-medium" style={{ color: '#2563eb' }}>
@@ -1226,6 +1388,7 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

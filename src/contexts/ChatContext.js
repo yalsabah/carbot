@@ -235,14 +235,19 @@ export function ChatProvider({ children }) {
   // message. Used to refresh `totalCost` once 3D generation finishes after
   // the message was already saved.
   const updateMessage = useCallback(async (sessionId, messageId, patch) => {
-    if (!user || !sessionId || !messageId) return;
-    if (sessionId.startsWith('local-')) return;
+    if (!messageId) return;
+    const clean = {};
+    for (const [k, v] of Object.entries(patch || {})) {
+      if (v !== undefined) clean[k] = v;
+    }
+    if (Object.keys(clean).length === 0) return;
+    // Patch local state by ID FIRST so the React tree reflects the change
+    // even when the Firestore write is skipped (anonymous / local-only) or
+    // racing (e.g. another analysis started before this one's 3D job
+    // resolved — updateLastMessage would land on the wrong message).
+    setMessages(prev => prev.map(m => m.id === messageId ? { ...m, ...clean } : m));
+    if (!user || !sessionId || sessionId.startsWith('local-')) return;
     try {
-      const clean = {};
-      for (const [k, v] of Object.entries(patch || {})) {
-        if (v !== undefined) clean[k] = v;
-      }
-      if (Object.keys(clean).length === 0) return;
       await updateDoc(
         doc(db, 'users', user.uid, 'sessions', sessionId, 'messages', messageId),
         clean

@@ -17,6 +17,22 @@ import ErrorBoundary from './components/ErrorBoundary';
 
 function AppInner() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Remember the sidebar state from before the report modal opened so we
+  // can restore it on close. Auto-collapsing during side-by-side report
+  // viewing maximizes the chat ↔ report split; restoring on close avoids
+  // surprising users who deliberately had the sidebar open.
+  const sidebarStateBeforeModalRef = useRef(null);
+  const handleReportModalChange = (isOpen) => {
+    if (isOpen) {
+      if (sidebarStateBeforeModalRef.current === null) {
+        sidebarStateBeforeModalRef.current = sidebarCollapsed;
+        setSidebarCollapsed(true);
+      }
+    } else if (sidebarStateBeforeModalRef.current !== null) {
+      setSidebarCollapsed(sidebarStateBeforeModalRef.current);
+      sidebarStateBeforeModalRef.current = null;
+    }
+  };
   // rightSidebarCollapsed state retired — the right panel is now a
   // top-right "Session Info" dropdown (SessionInfoButton). The dropdown
   // owns its own open/close state internally.
@@ -161,6 +177,7 @@ function AppInner() {
           onShowAuth={() => setShowAuth(true)}
           compactTriggerRef={compactTriggerRef}
           onCompactingChange={setIsCompacting}
+          onReportModalChange={handleReportModalChange}
         />
       </div>
 

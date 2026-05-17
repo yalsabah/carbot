@@ -678,7 +678,7 @@ async function userImageToTripoFormat(img) {
 }
 
 // ─── Main ChatInterface ────────────────────────────────────────────────────────
-export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTriggerRef, onCompactingChange }) {
+export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTriggerRef, onCompactingChange, onReportModalChange }) {
 	const { user, userDoc } = useAuth();
 	const {
 		messages,
@@ -705,6 +705,31 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 	const [showContextModal, setShowContextModal] = useState(false);
 	const [activeReport, setActiveReport] = useState(null);
 	const [showReportModal, setShowReportModal] = useState(false);
+	// Report modal presentation: 'sideBySide' (chat stays visible to the
+	// left, modal occupies a draggable portion of the viewport on the right)
+	// vs 'full' (classic immersive full-screen with backdrop). Default to
+	// sideBySide so users can keep answering Claude's clarifying questions
+	// without dismissing the report.
+	const [reportLayout, setReportLayout] = useState('sideBySide');
+	// User-adjustable width for the side-by-side modal, as a percentage of
+	// the viewport. Persisted to localStorage so a user's preferred split
+	// sticks across sessions. Clamped to [30, 90] on read + resize.
+	const [reportWidthPct, setReportWidthPctRaw] = useState(() => {
+		try {
+			const raw = window.localStorage.getItem('reportWidthPct');
+			const n = raw ? parseFloat(raw) : NaN;
+			if (Number.isFinite(n) && n >= 30 && n <= 90) return n;
+		} catch {}
+		return 65;
+	});
+	// During drag the transition is disabled (so the modal tracks the cursor
+	// 1:1 instead of lagging behind). Flipped on by the resize handle.
+	const [isResizingReport, setIsResizingReport] = useState(false);
+	const setReportWidthPct = (n) => {
+		const clamped = Math.max(30, Math.min(90, n));
+		setReportWidthPctRaw(clamped);
+		try { window.localStorage.setItem('reportWidthPct', String(clamped)); } catch {}
+	};
 	// Ref-mirrored activeReport so callbacks (openReport, etc.) can read
 	// the latest value without depending on activeReport in their dep
 	// arrays — that would cause them to be recreated on every render and
@@ -713,6 +738,16 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 	useEffect(() => {
 		activeReportRef.current = activeReport;
 	}, [activeReport]);
+
+	// Notify the parent (App.js) whenever the report modal opens or closes
+	// so it can auto-collapse the left sidebar — giving the chat ↔ report
+	// split the full screen. App.js restores the user's prior sidebar state
+	// when the modal closes.
+	useEffect(() => {
+		if (typeof onReportModalChange === 'function') {
+			onReportModalChange(showReportModal);
+		}
+	}, [showReportModal, onReportModalChange]);
 
 	// Last-known set of user-uploaded vehicle photos for the active session,
 	// keyed by sessionId. We push to this every time `runAnalysis` runs with
@@ -1757,13 +1792,20 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					// slug cache often misses on followups.)
 					if (reuse3DModel && inheritedGlbUrl && sessionId && persistedId) {
 						const isTripoUrlStr = typeof inheritedGlbUrl === "string" && /tripo3d\.com\//.test(inheritedGlbUrl);
+						// Replicate's CDN URLs (replicate.delivery/...) are signed
+						// with a ~1h TTL — much shorter than Tripo's ~24h. We mark
+						// these with a 50-min expiry so the cache doesn't hand
+						// back a 404'ing URL on the next reopen.
+						const isReplicateUrlStr = typeof inheritedGlbUrl === "string" && /replicate\.delivery\//.test(inheritedGlbUrl);
 						const patch = {
 							glbUrl: inheritedGlbUrl,
-							glbUrlSource: isTripoUrlStr ? "tripo" : "r2",
+							glbUrlSource: isTripoUrlStr ? "tripo" : isReplicateUrlStr ? "replicate" : "r2",
 							modelProvider: inheritedModelProvider || null,
 						};
 						if (isTripoUrlStr) {
 							patch.glbUrlExpiresAt = Date.now() + 22 * 60 * 60 * 1000;
+						} else if (isReplicateUrlStr) {
+							patch.glbUrlExpiresAt = Date.now() + 50 * 60 * 1000;
 						}
 						updateLastMessage((prev) => ({ ...prev, ...patch }));
 						updateMessage(sessionId, persistedId, patch);
@@ -1996,13 +2038,18 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					// rewording the trim).
 					if (ctx.inheritedGlbUrl && sessionId && persistedId) {
 						const isTripoUrlStr = typeof ctx.inheritedGlbUrl === "string" && /tripo3d\.com\//.test(ctx.inheritedGlbUrl);
+						// Replicate signs CDN URLs for ~1h; tag them as such so
+						// the read-side knows to treat the cache as stale shortly.
+						const isReplicateUrlStr = typeof ctx.inheritedGlbUrl === "string" && /replicate\.delivery\//.test(ctx.inheritedGlbUrl);
 						const patch = {
 							glbUrl: ctx.inheritedGlbUrl,
-							glbUrlSource: isTripoUrlStr ? "tripo" : "r2",
+							glbUrlSource: isTripoUrlStr ? "tripo" : isReplicateUrlStr ? "replicate" : "r2",
 							modelProvider: ctx.inheritedModelProvider || null,
 						};
 						if (isTripoUrlStr) {
 							patch.glbUrlExpiresAt = Date.now() + 22 * 60 * 60 * 1000;
+						} else if (isReplicateUrlStr) {
+							patch.glbUrlExpiresAt = Date.now() + 50 * 60 * 1000;
 						}
 						updateLastMessage((prev) => ({ ...prev, ...patch }));
 						updateMessage(sessionId, persistedId, patch);
@@ -2197,10 +2244,24 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 
 	const isEmpty = messages.length === 0;
 
+	// Side-by-side report modal compresses the chat area to the left so the
+	// user can keep chatting without dismissing the report. The padding
+	// tracks the modal's live width (which the user can drag). When the
+	// modal is closed or in full-screen mode, the chat expands back to full
+	// width. Transition is disabled mid-drag so the chat edge follows the
+	// cursor 1:1.
+	const sideModalActive =
+		showReportModal && activeReport && activeReport.mode !== 'sell' && reportLayout === 'sideBySide';
+	const chatSidePadding = sideModalActive ? `${reportWidthPct}vw` : 0;
+
 	return (
 		<div
-			className="flex flex-col h-full"
-			style={{ background: "var(--color-bg)" }}
+			className="flex flex-col h-full chat-with-side-modal"
+			style={{
+				background: "var(--color-bg)",
+				paddingRight: chatSidePadding,
+				transition: isResizingReport ? 'none' : undefined,
+			}}
 		>
 			{/* Mode tabs — Buy / Sell / Find. Switches the analysis flow without
 			    reloading the page. Sits above the chat content so the active
@@ -2355,13 +2416,21 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 										//     expiry (Tripo's CloudFront signatures last ~24h).
 										const isTripoUrl = (u) =>
 											typeof u === "string" && /tripo3d\.com\//.test(u);
+										const isReplicateUrl = (u) =>
+											typeof u === "string" && /replicate\.delivery\//.test(u);
 										const isDevEnv = process.env.NODE_ENV !== "production";
 										let resolvedGlbUrl = m._glbUrl || null;
 										if (!resolvedGlbUrl && m.glbUrl) {
 											const expiresAt = m.glbUrlExpiresAt;
 											const expired =
 												typeof expiresAt === "number" && Date.now() > expiresAt;
-											if (!expired) {
+											// Replicate URLs without a recorded expiry come from messages
+											// saved before we tracked Replicate's ~1h TTL. Treat them as
+											// definitively stale so the preflight doesn't CORS-fail on them
+											// in the console — fall through to lookupCachedModel instead.
+											const replicateNoExpiry =
+												isReplicateUrl(m.glbUrl) && typeof expiresAt !== "number";
+											if (!expired && !replicateNoExpiry) {
 												if (isTripoUrl(m.glbUrl)) {
 													if (isDevEnv) {
 														resolvedGlbUrl = `/dev-glb-proxy?url=${encodeURIComponent(m.glbUrl)}`;
@@ -2515,6 +2584,11 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					glbUrl={activeReport.glbUrl}
 					modelStatus={activeReport.modelStatus}
 					modelProvider={activeReport.modelProvider || null}
+					layout={reportLayout}
+					onChangeLayout={setReportLayout}
+					widthPct={reportWidthPct}
+					onChangeWidthPct={setReportWidthPct}
+					onResizingChange={setIsResizingReport}
 					userImages={activeReport.userImages || []}
 					onAddImage={handleAddImageToReport}
 					isReanalyzing={isAnalyzing}
