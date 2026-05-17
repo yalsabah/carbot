@@ -19,6 +19,7 @@ import {
   doc, getDoc, runTransaction, serverTimestamp, updateDoc,
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
+import { fetchVinAuditImages } from './vinAuditImages';
 
 // Dev-only diagnostic logger. Stripped in production builds.
 // Filter by typing `[3d]` in the DevTools console filter box.
@@ -150,18 +151,395 @@ async function tripoPoll(taskId) {
 // directly, or null if nothing usable came back. Replaces the older
 // shape (which expected an image URL from /api/vinaudit — that endpoint
 // is for market values, not images, and silently always returned null).
-async function fetchVinAuditPhoto(vin) {
+//
+// Routes through the cached `fetchVinAuditImages` helper so the 3D
+// pipeline benefits from the same L1 (in-session) + L2 (Firestore by
+// year-make-model) cache as the Car Images tab. Vehicle metadata is
+// optional but recommended — without it we still cache by VIN, but the
+// cross-trim sharing benefit is lost.
+async function fetchVinAuditPhoto(vin, vehicle = null) {
   if (!vin) return null;
   try {
-    const res = await fetch(`/api/vinaudit-images?vin=${encodeURIComponent(vin)}`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const first = data?.images?.[0];
+    const images = await fetchVinAuditImages(vin, vehicle ? { vehicle } : {});
+    const first = images?.[0];
     if (!first?.base64 || !first?.mediaType) return null;
     return { base64: first.base64, mediaType: first.mediaType };
   } catch {
     return null;
   }
+}
+
+// ─── Provider selection ──────────────────────────────────────────────────────
+// Three image-to-3D backends are wired (priority order):
+//   - 'replicate' (Replicate's firtoz/trellis) — DEFAULT, TRELLIS quality, ~$0.036/run
+//   - 'tripo'     (Tripo3D)                    — automatic fallback when replicate fails
+//   - 'trellis'   (NVIDIA-hosted TRELLIS NIM)  — playground demo only, do not use
+//
+// Replicate's firtoz/trellis is the same Microsoft TRELLIS model that
+// NVIDIA's playground hosts, but with a real REST API that accepts
+// user-uploaded images. ~88% cheaper than Tripo3D, comparable quality,
+// 26s typical run time.
+//
+// On Replicate failure (network error, rate limit, model error) we
+// automatically fall through to Tripo3D so users never see a broken
+// state. Tripo3D was the original provider and remains fully wired as
+// the safety net.
+//
+// NVIDIA's hosted TRELLIS at build.nvidia.com is a playground demo —
+// its `image` field is hardcoded to 4 example_id values and rejects
+// user uploads with HTTP 422 ("Expected: example_id, got: asset_id").
+// The scaffolding is kept behind the 'trellis' flag but never default.
+const MODEL_PROVIDER = (process.env.REACT_APP_MODEL_PROVIDER || 'replicate').toLowerCase();
+
+// ─── TRELLIS submit + wait ───────────────────────────────────────────────────
+// Same shape as Tripo's submit/wait so generateOrFetch3D can use either
+// provider transparently.
+//
+// taskId on the return value is the NVCF request ID; pass to waitTrellis().
+async function trellisSubmit(imageBase64, mediaType) {
+  const res = await fetch('/api/trellis/submit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageBase64, mediaType }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    // Log the FULL response including NVIDIA's upstream error body so we
+    // can see the actual rejection reason in the browser console. Without
+    // this we just see "trellis_error" which isn't actionable.
+    dwarn('trellisSubmit non-OK', {
+      status: res.status,
+      error: body?.error,
+      nvidiaStatus: body?.status,
+      nvidiaBody: body?.body,
+      full: body,
+    });
+    throw new Error(body?.error || `trellis_submit_${res.status}`);
+  }
+  const data = await res.json();
+  // Sync path: NVIDIA returned the GLB inline. Wrap it as if it were a
+  // taskId; waitTrellis() detects the sentinel and returns immediately.
+  if (data.mode === 'sync') {
+    return { taskId: `sync:${Math.random().toString(36).slice(2, 10)}`, _syncGlb: data.glbBase64 };
+  }
+  if (data.mode === 'async') {
+    return { taskId: data.requestId };
+  }
+  throw new Error('trellis_unknown_mode');
+}
+
+async function waitTrellis(taskId, onProgress, signal, slug) {
+  // Sync fast-path: submit already returned the GLB inline; the caller
+  // stored it on the job object and we synthesize the same shape Tripo's
+  // wait returns. (handled by caller — see generateOrFetch3D)
+  const INTERVAL = 4000;
+  const TIMEOUT = 5 * 60 * 1000; // TRELLIS is fast — 90s typical, 5min hard cap
+  const start = Date.now();
+  while (Date.now() - start < TIMEOUT) {
+    if (signal?.aborted) return null;
+    await new Promise((r) => setTimeout(r, INTERVAL));
+    if (signal?.aborted) return null;
+    try {
+      const res = await fetch(
+        `/api/trellis/status?requestId=${encodeURIComponent(taskId)}&slug=${encodeURIComponent(slug || '')}`,
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.status === 'pending') {
+        onProgress?.({ status: 'Running', progress: Math.min(95, ((Date.now() - start) / TIMEOUT) * 95) });
+        continue;
+      }
+      if (data.status === 'ready' && data.glbUrl) {
+        dlog('trellis ready', { slug, source: data.source, dev: data.dev });
+        return { glbUrl: data.glbUrl, source: data.source, dev: data.dev };
+      }
+      if (data.status === 'failed') {
+        dwarn('trellis failed', data);
+        return null;
+      }
+    } catch (err) {
+      dwarn('trellis poll threw', err);
+      // keep trying — transient network errors are common during long polls
+    }
+  }
+  dwarn('trellis wait timed out');
+  return null;
+}
+
+// ─── Replicate (firtoz/trellis) submit + wait ─────────────────────────────────
+// Same shape as Tripo's submit/wait so the orchestrator can use it
+// transparently. The status endpoint relays the GLB to R2 server-side,
+// so this returns a final R2 URL with no separate persist step.
+async function replicateSubmit({ imageBase64, mediaType, imageUrl }) {
+  const doFetch = () =>
+    fetch('/api/replicate/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64, mediaType, imageUrl }),
+    });
+
+  let res = await doFetch();
+
+  // Rate-limit retry: Replicate's 429 response carries `retry_after`
+  // (seconds). When that's a small number, the right move is to wait
+  // and retry once before falling through to Tripo3D — saves the Tripo
+  // cost during transient rate-limit blips. We cap the wait at 12s so
+  // a user's analysis isn't stalled for too long; longer rate-limit
+  // windows fall through to Tripo immediately.
+  if (res.status === 429) {
+    const body = await res.json().catch(() => ({}));
+    // The proxied body wraps Replicate's body as a string. Parse out
+    // retry_after if present.
+    let retryAfter = null;
+    try {
+      const inner = body?.body ? JSON.parse(body.body) : null;
+      retryAfter = Number(inner?.retry_after);
+    } catch {
+      retryAfter = null;
+    }
+    if (Number.isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 12) {
+      dlog(`replicateSubmit got 429, retrying after ${retryAfter}s`);
+      await new Promise((r) => setTimeout(r, retryAfter * 1000 + 250));
+      res = await doFetch();
+    } else {
+      // Long wait or no retry_after — surface to caller, fall through to Tripo.
+      dwarn('replicateSubmit 429 (no retry — too long or unspecified)', {
+        retryAfter,
+        body: body?.body,
+      });
+      throw new Error('replicate_rate_limited');
+    }
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    dwarn('replicateSubmit non-OK', {
+      status: res.status,
+      error: body?.error,
+      replicateStatus: body?.status,
+      replicateBody: body?.body,
+    });
+    throw new Error(body?.error || `replicate_submit_${res.status}`);
+  }
+  const data = await res.json();
+  if (!data.predictionId) throw new Error('replicate_no_prediction_id');
+  return { predictionId: data.predictionId };
+}
+
+async function waitReplicate(predictionId, onProgress, signal, slug) {
+  const INTERVAL = 3000; // Replicate runs in ~26s, so 3s poll is reasonable
+  const TIMEOUT = 5 * 60 * 1000; // 5min hard cap — generous vs 26s typical
+  const start = Date.now();
+  while (Date.now() - start < TIMEOUT) {
+    if (signal?.aborted) return null;
+    await new Promise((r) => setTimeout(r, INTERVAL));
+    if (signal?.aborted) return null;
+    try {
+      const res = await fetch(
+        `/api/replicate/status?predictionId=${encodeURIComponent(predictionId)}&slug=${encodeURIComponent(slug || '')}`,
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.status === 'pending') {
+        onProgress?.({
+          status: 'Running',
+          progress: Math.min(95, ((Date.now() - start) / 60000) * 100), // rough % based on expected ~26s
+        });
+        continue;
+      }
+      if (data.status === 'ready' && data.glbUrl) {
+        dlog('replicate ready', { slug, source: data.source, dev: data.dev });
+        return { glbUrl: data.glbUrl, source: data.source, dev: data.dev };
+      }
+      if (data.status === 'failed') {
+        dwarn('replicate failed', data);
+        return null;
+      }
+    } catch (err) {
+      dwarn('replicate poll threw', err);
+      // Keep trying — transient network errors are common during long polls.
+    }
+  }
+  dwarn('replicate wait timed out');
+  return null;
+}
+
+// Full Replicate pipeline — submit, poll, mark slug ready in Firestore.
+// Returns { glbUrl, slug, fromCache: false } on success, or null so the
+// caller can fall back to Tripo3D.
+async function runReplicatePipeline({
+  slug, claim, prefetchedImage, vin, vehicle, onProgress, onCost, signal,
+  // Legacy fields kept for backward compat if a caller bypasses generateOrFetch3D.
+  images, imageBase64, imageMediaType,
+}) {
+  const img = prefetchedImage
+    || (await resolveImageForGeneration({ images, imageBase64, imageMediaType, vin, vehicle, onCost }));
+  if (!img) {
+    dwarn('Replicate: no image to submit');
+    return null;
+  }
+  onProgress?.({ status: 'Submitting', progress: 0 });
+
+  let submitRes;
+  try {
+    submitRes = await replicateSubmit({ imageBase64: img.base64, mediaType: img.mediaType });
+  } catch (err) {
+    dwarn('Replicate submit threw', err);
+    return null;
+  }
+  // Replicate firtoz/trellis pricing — $0.036/run as of writing. Adjust
+  // here when their pricing changes.
+  onCost?.({ label: 'Replicate TRELLIS (image-to-3D)', amount: 0.036, detail: `source: ${img.source}` });
+
+  onProgress?.({ status: 'Pending', progress: 0 });
+  if (slug && claim?.action === 'claim' && submitRes.predictionId) {
+    // Tag prediction in localStorage so a refresh-during-poll can recover.
+    // Reuses the Tripo recovery slot — `recordPendingJob` is provider-agnostic.
+    recordPendingJob(slug, submitRes.predictionId, vin || null);
+  }
+
+  const result = await waitReplicate(submitRes.predictionId, onProgress, signal, slug || '');
+  if (!result?.glbUrl) {
+    if (slug && claim?.action === 'claim') {
+      await markFailed(slug, 'replicate_no_url');
+      clearPendingJob(slug);
+    }
+    return null;
+  }
+
+  // Persist to Firestore. In prod, glbUrl is the R2 URL the status
+  // endpoint produced — long-lived, fine to cache forever. In dev, it's
+  // the Replicate CDN URL — usable for the session but not durable
+  // (signed URLs from Replicate's CDN can expire), so we don't cache it.
+  const isReplicateCdn = /replicate\.delivery/i.test(result.glbUrl) || /replicate\.com/i.test(result.glbUrl);
+  if (slug && claim?.action === 'claim') {
+    if (!isReplicateCdn) {
+      // R2 URL — permanent. Cache forever.
+      await markReady(slug, result.glbUrl, vin || null, { source: 'r2', modelProvider: 'replicate-trellis' });
+      dlog('Replicate: markReady with R2 URL', { url: result.glbUrl.slice(0, 80) });
+    } else if (process.env.NODE_ENV !== 'production') {
+      // Dev — persist the Replicate URL with a 22h expiry. Replicate's
+      // CDN URLs are signed but typically valid for at least a day, so
+      // same-day reopens will cache-hit. After expiry, the slug
+      // re-claims and regenerates.
+      const expiresAt = Date.now() + 22 * 60 * 60 * 1000;
+      await markReady(slug, result.glbUrl, vin || null, { source: 'replicate', expiresAt, modelProvider: 'replicate-trellis' });
+      dlog('Dev: markReady with Replicate URL + expiresAt');
+    } else {
+      // Prod somehow got a Replicate URL instead of R2 — means R2
+      // misconfigured. Mark failed so the user sees fallback.
+      await markFailed(slug, 'replicate_returned_cdn_url_in_prod');
+    }
+    clearPendingJob(slug);
+  }
+
+  return {
+    glbUrl: maybeProxyForDev(result.glbUrl),
+    slug,
+    fromCache: false,
+    modelProvider: 'replicate-trellis',
+  };
+}
+
+// Resolve the input image for TRELLIS: prefer the user's photo (first
+// entry in the `images` array), then a legacy single-image arg, then
+// VinAudit's stock photo when only a VIN is available.
+async function resolveImageForGeneration({ images, imageBase64, imageMediaType, vin, vehicle, onCost }) {
+  if (Array.isArray(images) && images.length > 0) {
+    const first = images.find((i) => i?.base64 && i?.mediaType);
+    if (first) return { base64: first.base64, mediaType: first.mediaType, source: 'photo' };
+  }
+  if (imageBase64 && imageMediaType) {
+    return { base64: imageBase64, mediaType: imageMediaType, source: 'photo' };
+  }
+  if (vin) {
+    // Pass vehicle metadata so the L2 cache key is year-make-model-based
+    // (cross-trim sharing) instead of VIN-only.
+    const stock = await fetchVinAuditPhoto(vin, vehicle);
+    if (stock) {
+      onCost?.({ label: 'VinAudit (image lookup)', amount: 0.05, detail: 'stock photo for 3D' });
+      return { base64: stock.base64, mediaType: stock.mediaType, source: 'vinaudit' };
+    }
+  }
+  return null;
+}
+
+// Full TRELLIS generation flow — submit, poll, R2 relay, markReady.
+// Returns { glbUrl, slug, fromCache: false } on success, or null to let
+// the caller fall back to Tripo3D.
+async function runTrellisPipeline({
+  slug, claim, prefetchedImage, vin, vehicle, onProgress, onCost, signal,
+  // Legacy fields kept for backward compat.
+  images, imageBase64, imageMediaType,
+}) {
+  const img = prefetchedImage
+    || (await resolveImageForGeneration({ images, imageBase64, imageMediaType, vin, vehicle, onCost }));
+  if (!img) {
+    dwarn('TRELLIS: no image to submit (no user photo + VinAudit returned none)');
+    return null;
+  }
+  onProgress?.({ status: 'Submitting', progress: 0 });
+
+  let submitRes;
+  try {
+    submitRes = await trellisSubmit(img.base64, img.mediaType);
+  } catch (err) {
+    dwarn('TRELLIS submit threw', err);
+    return null;
+  }
+  // TRELLIS pricing — adjust once NVIDIA confirms per-call cost on your tier.
+  onCost?.({ label: 'NVIDIA TRELLIS (image-to-3D)', amount: 0.25, detail: `source: ${img.source}` });
+
+  // Sync path — submit returned the GLB inline. We still need to land it
+  // in R2 so future users hit the cache. Hand it to /api/trellis/status as
+  // if it were a completed async job. (In dev there's no R2, so we get a
+  // data URL back — fine for the current session.)
+  // For simplicity in this first pass, the sync inline-GLB path returns a
+  // data URL only. R2 persistence for the sync case is a follow-up. The
+  // overwhelmingly common case is async (30-90s).
+  if (submitRes._syncGlb) {
+    const dataUrl = `data:model/gltf-binary;base64,${submitRes._syncGlb}`;
+    onProgress?.({ status: 'Done', progress: 100 });
+    if (slug && claim?.action === 'claim') {
+      // Don't persist a data URL to Firestore — too large + not durable.
+      // Treat it like a one-session render.
+      await markFailed(slug, 'trellis_sync_no_r2_persistence');
+      clearPendingJob(slug);
+    }
+    return { glbUrl: dataUrl, slug, fromCache: false, modelProvider: 'nvidia-trellis' };
+  }
+
+  // Async path — poll status until ready. The status endpoint uploads to
+  // R2 server-side and returns a permanent URL.
+  onProgress?.({ status: 'Pending', progress: 0 });
+  if (slug && claim?.action === 'claim' && submitRes.taskId) {
+    recordPendingJob(slug, submitRes.taskId, vin || null);
+  }
+  const result = await waitTrellis(submitRes.taskId, onProgress, signal, slug || '');
+  if (!result?.glbUrl) {
+    if (slug && claim?.action === 'claim') {
+      await markFailed(slug, 'trellis_no_url');
+      clearPendingJob(slug);
+    }
+    return null;
+  }
+
+  // Persist to Firestore. In prod, glbUrl is an R2 URL — long-lived,
+  // permanent, fine to cache forever. In dev, it's a data URL — too large
+  // for Firestore (1MB doc limit) so we just hand it back to the caller
+  // without persistence.
+  const isDataUrl = result.glbUrl.startsWith('data:');
+  if (slug && claim?.action === 'claim') {
+    if (!isDataUrl) {
+      await markReady(slug, result.glbUrl, vin || null, { source: 'r2', modelProvider: 'nvidia-trellis' });
+      dlog('TRELLIS: markReady with R2 URL', { url: result.glbUrl.slice(0, 80) });
+    } else if (process.env.NODE_ENV === 'production') {
+      await markFailed(slug, 'trellis_returned_data_url_in_prod');
+    }
+    clearPendingJob(slug);
+  }
+
+  return { glbUrl: result.glbUrl, slug, fromCache: false, modelProvider: 'nvidia-trellis' };
 }
 
 // ─── Tripo3D submit + wait (kept exported; legacy callers still work) ─────────
@@ -314,7 +692,12 @@ export async function lookupCachedModel(vehicle) {
     return null;
   }
   dlog('lookupCachedModel: cache hit', { slug });
-  return { glbUrl: maybeProxyForDev(data.glbUrl), slug, fromCache: true };
+  return {
+    glbUrl: maybeProxyForDev(data.glbUrl),
+    slug,
+    fromCache: true,
+    modelProvider: data.modelProvider || null,
+  };
 }
 
 async function attemptClaim(slug, vehicle) {
@@ -328,7 +711,7 @@ async function attemptClaim(slug, vehicle) {
         // signatures expire ~24h. In dev, allow them up to glbUrlExpiresAt
         // so cross-session cache works without R2.
         if (isUsableCachedDoc(data)) {
-          return { action: 'cache_hit', glbUrl: data.glbUrl };
+          return { action: 'cache_hit', glbUrl: data.glbUrl, modelProvider: data.modelProvider || null };
         }
         dlog('attemptClaim: ready doc not usable (expired Tripo or prod-Tripo), re-claiming', slug);
       }
@@ -368,7 +751,9 @@ async function pollCacheUntilReady(slug, signal) {
       const snap = await getDoc(ref);
       if (!snap.exists()) return null;
       const data = snap.data();
-      if (data.status === 'ready' && data.glbUrl) return data.glbUrl;
+      if (data.status === 'ready' && data.glbUrl) {
+        return { glbUrl: data.glbUrl, modelProvider: data.modelProvider || null };
+      }
       if (data.status === 'failed') return null;
     } catch {
       // transient — keep polling
@@ -417,6 +802,12 @@ async function markReady(slug, glbUrl, sourceVin, opts = {}) {
       sourceVin: sourceVin || null,
       glbUrlSource: opts.source || (isTripoCdnUrl(glbUrl) ? 'tripo' : 'r2'),
     };
+    // modelProvider tracks the GENERATOR (tripo / replicate-trellis / nvidia-trellis),
+    // separate from glbUrlSource which tracks the HOST (r2 / tripo CDN / replicate CDN).
+    // Needed so the modal can show the user which provider built the model.
+    if (opts.modelProvider) {
+      patch.modelProvider = opts.modelProvider;
+    }
     // expiresAt is only set for Tripo URLs in dev; R2 URLs never expire so
     // we explicitly omit the field rather than carrying a stale one over.
     if (typeof opts.expiresAt === 'number') {
@@ -520,11 +911,11 @@ export async function recoverPendingJobs() {
         try {
           const r2Url = await persistGlbToR2(job.slug, glbUrl);
           if (r2Url) {
-            await markReady(job.slug, r2Url, job.vin || null, { source: 'r2' });
+            await markReady(job.slug, r2Url, job.vin || null, { source: 'r2', modelProvider: 'tripo' });
             dlog('recoverPendingJobs: recovered with R2 URL', { slug: job.slug });
           } else if (process.env.NODE_ENV !== 'production') {
             const expiresAt = Date.now() + 22 * 60 * 60 * 1000;
-            await markReady(job.slug, glbUrl, job.vin || null, { source: 'tripo', expiresAt });
+            await markReady(job.slug, glbUrl, job.vin || null, { source: 'tripo', expiresAt, modelProvider: 'tripo' });
             dlog('recoverPendingJobs: recovered with Tripo URL (dev)', { slug: job.slug });
           } else {
             await markFailed(job.slug, 'recovery_r2_returned_null_in_prod');
@@ -597,30 +988,102 @@ export async function generateOrFetch3D({
       onProgress?.({ status: 'CacheHit', progress: 100 });
       dlog('cache hit — returning early', { slug, glbUrl: claim.glbUrl });
       // Cache hit — no costs incurred at all (no Tripo3D, no VinAudit image lookup).
-      return { glbUrl: maybeProxyForDev(claim.glbUrl), slug, fromCache: true };
+      return {
+        glbUrl: maybeProxyForDev(claim.glbUrl),
+        slug,
+        fromCache: true,
+        modelProvider: claim.modelProvider || null,
+      };
     }
     if (claim?.action === 'wait') {
       onProgress?.({ status: 'WaitingForOther', progress: 0 });
       dlog('claim is pending elsewhere, polling cache');
-      const glbUrl = await pollCacheUntilReady(slug, signal);
-      if (glbUrl) {
-        dlog('follower poll resolved', { glbUrl });
-        return { glbUrl: maybeProxyForDev(glbUrl), slug, fromCache: true };
+      const polled = await pollCacheUntilReady(slug, signal);
+      if (polled?.glbUrl) {
+        dlog('follower poll resolved', { glbUrl: polled.glbUrl });
+        return {
+          glbUrl: maybeProxyForDev(polled.glbUrl),
+          slug,
+          fromCache: true,
+          modelProvider: polled.modelProvider || null,
+        };
       }
       dwarn('follower poll exhausted — falling through to self-generate');
       // The other client failed — we fall through and try ourselves.
     }
   }
 
-  // 2. Generate via Tripo3D. Prefer the multi-image array if provided so the
-  //    caller can pass several photos and we pick the best one.
+  // Resolve the input image AFTER the cache check (so cache hits never pay
+  // for a VinAudit lookup) but BEFORE submitting to any provider. If there
+  // is no user photo AND VinAudit has no coverage for this VIN, no generator
+  // can produce a model — and the slug claim above would otherwise leave
+  // an orphaned "pending" doc that other tabs would poll until it went
+  // stale (10min). Bail out and explicitly markFailed so followers unblock.
+  const prefetchedImage = await resolveImageForGeneration({
+    images,
+    imageBase64,
+    imageMediaType,
+    vin,
+    vehicle,
+    onCost,
+  });
+  if (!prefetchedImage) {
+    dwarn('generateOrFetch3D: no source image available (no user photo + no VinAudit coverage) — skipping generation');
+    if (slug && claim?.action === 'claim') {
+      await markFailed(slug, 'no_source_image');
+    }
+    return null;
+  }
+
+  // 2a. Provider switch — try the configured provider first. On failure
+  //     (no GLB, network error, rate limit), fall through to Tripo3D as
+  //     the automatic safety net so users never see a broken state.
+  //
+  //     Both 'replicate' and 'trellis' have their /status endpoint relay
+  //     the GLB into R2 server-side, so there's no separate persist step
+  //     on those paths — they return a final URL directly.
+  if (MODEL_PROVIDER === 'replicate') {
+    const replicateResult = await runReplicatePipeline({
+      slug,
+      claim,
+      prefetchedImage,
+      vin,
+      vehicle,
+      onProgress,
+      onCost,
+      signal,
+    });
+    if (replicateResult) return replicateResult;
+    dwarn('Replicate returned no GLB — falling back to Tripo3D for this run');
+    // fall through to Tripo flow below
+  } else if (MODEL_PROVIDER === 'trellis') {
+    const trellisResult = await runTrellisPipeline({
+      slug,
+      claim,
+      prefetchedImage,
+      vin,
+      vehicle,
+      onProgress,
+      onCost,
+      signal,
+    });
+    if (trellisResult) return trellisResult;
+    dwarn('TRELLIS returned no GLB — falling back to Tripo3D for this run');
+    // fall through to Tripo flow below
+  }
+
+  // 2b. Generate via Tripo3D. We already resolved the source image above
+  //     (prefetchedImage), so feed it straight to submit3DJob as a one-entry
+  //     array — this skips submit3DJob's internal VinAudit fetch and avoids
+  //     double-charging the $0.05 lookup that resolveImageForGeneration
+  //     already emitted.
   let job;
   try {
-    if (Array.isArray(images) && images.length > 0) {
-      job = await submit3DJob(images, null, vin);
-    } else {
-      job = await submit3DJob(imageBase64, imageMediaType, vin);
-    }
+    job = await submit3DJob(
+      [{ base64: prefetchedImage.base64, mediaType: prefetchedImage.mediaType }],
+      null,
+      null, // vin omitted: we don't want submit3DJob to fall through to VinAudit
+    );
   } catch (err) {
     if (slug && claim?.action === 'claim') {
       await markFailed(slug, err?.message || 'submit_failed');
@@ -634,10 +1097,9 @@ export async function generateOrFetch3D({
     return null;
   }
   // Costs are committed at submit time — Tripo doesn't refund failed jobs.
-  if (job.source === 'vinaudit') {
-    onCost?.({ label: 'VinAudit (image lookup)', amount: 0.05, detail: 'stock photo for 3D' });
-  }
-  onCost?.({ label: 'Tripo3D image-to-3D', amount: 0.30, detail: `source: ${job.source}` });
+  // (VinAudit cost, if any, was already charged by resolveImageForGeneration
+  // above — we don't re-charge here.)
+  onCost?.({ label: 'Tripo3D image-to-3D', amount: 0.30, detail: `source: ${prefetchedImage.source}` });
   onProgress?.({ status: 'Pending', progress: 0 });
 
   // Record this Tripo task to localStorage IMMEDIATELY after submit so a
@@ -674,7 +1136,7 @@ export async function generateOrFetch3D({
       const r2Url = await persistGlbToR2(slug, tripoGlbUrl);
       if (r2Url) {
         finalUrl = r2Url;
-        await markReady(slug, r2Url, vin || null, { source: 'r2' });
+        await markReady(slug, r2Url, vin || null, { source: 'r2', modelProvider: 'tripo' });
         dlog('R2 persist OK; markReady with R2 URL', { r2Url: r2Url.slice(0, 80) });
       } else if (process.env.NODE_ENV !== 'production') {
         // Dev mode (no R2 binding). Persist the raw Tripo URL with a 22h
@@ -684,7 +1146,7 @@ export async function generateOrFetch3D({
         // second analysis of the same year/make/model/trim within the day
         // hits the slug doc and reuses the GLB instead of re-running Tripo.
         const expiresAt = Date.now() + 22 * 60 * 60 * 1000;
-        await markReady(slug, tripoGlbUrl, vin || null, { source: 'tripo', expiresAt });
+        await markReady(slug, tripoGlbUrl, vin || null, { source: 'tripo', expiresAt, modelProvider: 'tripo' });
         dlog('Dev: markReady with Tripo URL + expiresAt', {
           tripoUrl: tripoGlbUrl.slice(0, 80),
           expiresInH: 22,
@@ -726,5 +1188,5 @@ export async function generateOrFetch3D({
     proxiedForDev: displayUrl !== finalUrl,
     slug,
   });
-  return { glbUrl: displayUrl, slug, fromCache: false };
+  return { glbUrl: displayUrl, slug, fromCache: false, modelProvider: 'tripo' };
 }

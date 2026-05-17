@@ -42,8 +42,14 @@ export async function onRequestGet({ request, env }) {
   }
 
   // Build upstream query. We default to front_right + medium because that's
-  // a good Tripo3D input (clearly shows front + one side, ~1280x960 is
-  // enough resolution for image-to-3D without being wasteful).
+  // a good Tripo3D / TRELLIS input (clearly shows front + one side,
+  // ~1280x960 is enough resolution for image-to-3D without being wasteful).
+  //
+  // granularity defaults to 'model' so different trims of the same
+  // year/make/model share a single image — VinAudit returns the same
+  // photo for "2022 Audi S5 Premium" and "2022 Audi S5 Premium Plus"
+  // when granularity=model. Callers can override to 'trim' for trim-
+  // specific shots when needed (e.g. RS trims with unique fascias).
   const upstreamParams = new URLSearchParams({
     vin,
     key: KEY,
@@ -51,7 +57,7 @@ export async function onRequestGet({ request, env }) {
     pose: url.searchParams.get('pose') || 'front_right',
     size: url.searchParams.get('size') || 'medium',
     color: url.searchParams.get('color') || 'white',
-    granularity: 'trim',
+    granularity: url.searchParams.get('granularity') || 'model',
   });
 
   let data;

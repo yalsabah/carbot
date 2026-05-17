@@ -9,6 +9,9 @@ import {
   Car,
   PanelLeft,
   PanelLeftClose,
+  Pencil,
+  Check,
+  X,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { useChat } from '../contexts/ChatContext';
@@ -31,7 +34,32 @@ function readStoredWidth() {
 
 export default function Sidebar({ onOpenSettings, onOpenAuth, collapsed, onToggle }) {
   const { user, userDoc } = useAuth();
-  const { sessions, activeSessionId, loadSessions, loadSession, deleteSession, startNewChat } = useChat();
+  const { sessions, activeSessionId, loadSessions, loadSession, deleteSession, startNewChat, activeMode, renameSession } = useChat();
+  // Inline rename state — { id, draft } when a session is being renamed,
+  // null otherwise. Click the pencil → set this; Enter or blur saves,
+  // Esc cancels.
+  const [editing, setEditing] = useState(null);
+  const editInputRef = useRef(null);
+  // Two-step delete confirmation. First click on 🗑 puts that session
+  // into `confirmingDelete`; the row morphs into "Delete this chat?
+  // [Delete] [Cancel]" buttons. Second click on Delete actually deletes.
+  // Hit Esc to cancel from anywhere. Prevents accidental data loss from
+  // a misclick — particularly important since delete is permanent.
+  const [confirmingDelete, setConfirmingDelete] = useState(null);
+  useEffect(() => {
+    if (!confirmingDelete) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') setConfirmingDelete(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [confirmingDelete]);
+  // Filter the session list to chats from the currently active tab. Legacy
+  // sessions without a `mode` field default to 'buy' so existing data still
+  // shows up under the Buy tab.
+  const visibleSessions = (sessions || []).filter(
+    (s) => (s.mode || 'buy') === (activeMode || 'buy'),
+  );
   const { dark, toggle } = useTheme();
   const [hoverId, setHoverId] = useState(null);
   const [width, setWidth] = useState(readStoredWidth);
@@ -144,37 +172,151 @@ export default function Sidebar({ onOpenSettings, onOpenAuth, collapsed, onToggl
 
       {/* Sessions */}
       <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
-        {!collapsed && sessions.length > 0 && (
+        {!collapsed && visibleSessions.length > 0 && (
           <p className="px-2 pt-2 pb-1 text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-muted)' }}>
             History
           </p>
         )}
-        {!collapsed && sessions.map(s => (
-          <div
-            key={s.id}
-            onMouseEnter={() => setHoverId(s.id)}
-            onMouseLeave={() => setHoverId(null)}
-            className="group flex items-center gap-2 px-2 py-2 rounded-lg cursor-pointer transition-all"
-            style={{
-              background: activeSessionId === s.id ? 'var(--color-bg)' : 'transparent',
-              color: 'var(--color-text)',
-            }}
-            onClick={() => loadSession(s.id)}
-          >
-            <MessageSquare size={14} style={{ color: 'var(--color-muted)', flexShrink: 0 }} />
-            <span className="text-sm flex-1 truncate">{s.title || 'Assessment'}</span>
-            {hoverId === s.id && (
-              <button
-                onClick={e => { e.stopPropagation(); deleteSession(s.id); }}
-                className="opacity-60 hover:opacity-100 transition-opacity"
-              >
-                <Trash2 size={12} style={{ color: 'var(--color-muted)' }} />
-              </button>
-            )}
-          </div>
-        ))}
-        {!collapsed && user && sessions.length === 0 && (
-          <p className="px-2 py-4 text-xs text-center" style={{ color: 'var(--color-muted)' }}>No assessments yet</p>
+        {!collapsed && visibleSessions.map(s => {
+          const isEditing = editing?.id === s.id;
+          const isConfirmingDelete = confirmingDelete === s.id;
+          const startEdit = (e) => {
+            e.stopPropagation();
+            setEditing({ id: s.id, draft: s.title || '' });
+            // Focus + select after the input mounts.
+            setTimeout(() => {
+              if (editInputRef.current) {
+                editInputRef.current.focus();
+                editInputRef.current.select();
+              }
+            }, 0);
+          };
+          const commitEdit = () => {
+            if (!editing) return;
+            const next = editing.draft.trim();
+            if (next && next !== s.title) renameSession(s.id, next);
+            setEditing(null);
+          };
+          const cancelEdit = () => setEditing(null);
+          return (
+            <div
+              key={s.id}
+              onMouseEnter={() => setHoverId(s.id)}
+              onMouseLeave={() => setHoverId(null)}
+              className="group flex items-center gap-2 px-2 py-2 rounded-lg cursor-pointer transition-all"
+              style={{
+                background: activeSessionId === s.id ? 'var(--color-bg)' : 'transparent',
+                color: 'var(--color-text)',
+              }}
+              onClick={() => { if (!isEditing) loadSession(s.id); }}
+            >
+              <MessageSquare size={14} style={{ color: 'var(--color-muted)', flexShrink: 0 }} />
+              {isEditing ? (
+                <>
+                  <input
+                    ref={editInputRef}
+                    value={editing.draft}
+                    onChange={e => setEditing({ ...editing, draft: e.target.value })}
+                    onClick={e => e.stopPropagation()}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') { e.preventDefault(); commitEdit(); }
+                      else if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
+                    }}
+                    onBlur={commitEdit}
+                    maxLength={80}
+                    className="text-sm flex-1 bg-transparent outline-none border-b"
+                    style={{
+                      color: 'var(--color-text)',
+                      borderColor: 'var(--color-accent)',
+                      minWidth: 0,
+                    }}
+                  />
+                  <button
+                    onClick={e => { e.stopPropagation(); commitEdit(); }}
+                    title="Save"
+                    className="opacity-70 hover:opacity-100 transition-opacity"
+                  >
+                    <Check size={12} style={{ color: '#16a34a' }} />
+                  </button>
+                  <button
+                    onMouseDown={e => { e.preventDefault(); e.stopPropagation(); cancelEdit(); }}
+                    title="Cancel"
+                    className="opacity-70 hover:opacity-100 transition-opacity"
+                  >
+                    <X size={12} style={{ color: '#dc2626' }} />
+                  </button>
+                </>
+              ) : isConfirmingDelete ? (
+                <>
+                  <span className="text-xs flex-1 truncate" style={{ color: '#dc2626' }}>
+                    Delete this chat?
+                  </span>
+                  <button
+                    onClick={e => {
+                      e.stopPropagation();
+                      deleteSession(s.id);
+                      setConfirmingDelete(null);
+                    }}
+                    title="Confirm delete"
+                    className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider transition-opacity hover:opacity-80"
+                    style={{ background: '#dc2626', color: '#fff' }}
+                  >
+                    Delete
+                  </button>
+                  <button
+                    onClick={e => { e.stopPropagation(); setConfirmingDelete(null); }}
+                    title="Cancel"
+                    className="px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider transition-opacity hover:opacity-80"
+                    style={{
+                      border: '1px solid var(--color-border)',
+                      color: 'var(--color-muted)',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span className="text-sm flex-1 truncate" title={s.title || 'Assessment'}>
+                    {s.title || 'Assessment'}
+                  </span>
+                  {hoverId === s.id && (
+                    <>
+                      <button
+                        onClick={startEdit}
+                        title="Rename"
+                        className="opacity-60 hover:opacity-100 transition-opacity"
+                      >
+                        <Pencil size={12} style={{ color: 'var(--color-muted)' }} />
+                      </button>
+                      <button
+                        onClick={e => {
+                          e.stopPropagation();
+                          // First click arms the confirm state — second click
+                          // (on the now-visible Delete button) actually deletes.
+                          // This prevents accidental data loss from misclicks.
+                          setConfirmingDelete(s.id);
+                        }}
+                        title="Delete"
+                        className="opacity-60 hover:opacity-100 transition-opacity"
+                      >
+                        <Trash2 size={12} style={{ color: 'var(--color-muted)' }} />
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          );
+        })}
+        {!collapsed && user && visibleSessions.length === 0 && (
+          <p className="px-2 py-4 text-xs text-center" style={{ color: 'var(--color-muted)' }}>
+            {activeMode === 'sell'
+              ? 'No sell-mode chats yet'
+              : activeMode === 'find'
+              ? 'No find-mode chats yet'
+              : 'No assessments yet'}
+          </p>
         )}
         {!collapsed && !user && (
           <p className="px-2 py-4 text-xs text-center" style={{ color: 'var(--color-muted)' }}>Sign in to save history</p>

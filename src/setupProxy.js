@@ -20,8 +20,10 @@ const TRIPO_KEY         = pickEnv('TRIPO_KEY', 'TRIPO_API_KEY', 'REACT_APP_TRIPO
 const VINAUDIT_KEY      = pickEnv('VINAUDIT_KEY', 'VINAUDIT_API_KEY', 'REACT_APP_VINAUDIT_API_KEY');
 const VINCARIO_KEY      = pickEnv('VINCARIO_KEY');
 const VINCARIO_SECRET   = pickEnv('VINCARIO_SECRET');
-const STRIPE_SECRET_KEY = pickEnv('STRIPE_SECRET_KEY');
-const PUBLIC_BASE_URL   = pickEnv('PUBLIC_BASE_URL') || 'http://localhost:3000';
+const STRIPE_SECRET_KEY     = pickEnv('STRIPE_SECRET_KEY');
+const PUBLIC_BASE_URL       = pickEnv('PUBLIC_BASE_URL') || 'http://localhost:3000';
+const NVIDIA_TRELLIS_KEY    = pickEnv('NVIDIA_TRELLIS_API_KEY', 'NVIDIA_API_KEY');
+const REPLICATE_API_TOKEN   = pickEnv('REPLICATE_API_TOKEN');
 
 // Startup banner — confirms which keys actually loaded into this process.
 // Prints first/last 4 chars + length so you can eyeball it without leaking
@@ -39,6 +41,8 @@ console.log('  VINAUDIT_KEY   :', fingerprint(VINAUDIT_KEY));
 console.log('  VINCARIO_KEY   :', fingerprint(VINCARIO_KEY));
 console.log('  VINCARIO_SECRET:', fingerprint(VINCARIO_SECRET));
 console.log('  STRIPE_SECRET  :', fingerprint(STRIPE_SECRET_KEY));
+console.log('  NVIDIA_TRELLIS :', fingerprint(NVIDIA_TRELLIS_KEY));
+console.log('  REPLICATE_TOKEN:', fingerprint(REPLICATE_API_TOKEN));
 
 const stripBrowserHeaders = (proxyReq) => {
   proxyReq.removeHeader('origin');
@@ -354,6 +358,315 @@ module.exports = function (app) {
     }
   });
 
+  // NVIDIA TRELLIS — mirrors functions/api/trellis/{submit,status}.js.
+  // In dev there's no R2 binding, so the status endpoint can't persist the
+  // GLB to a permanent URL. Instead it returns the GLB as a data URL the
+  // client can render directly for the current session (no cache across
+  // refresh, which matches existing Tripo dev behavior).
+  const TRELLIS_ENDPOINT = 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis';
+  const NVCF_STATUS_BASE = 'https://api.nvcf.nvidia.com/v2/nvcf/pexec/status';
+
+  const extractGlbBase64 = (data) => {
+    if (!data) return null;
+    if (Array.isArray(data.artifacts) && data.artifacts.length > 0) {
+      const a = data.artifacts[0];
+      return a.base64 || a.b64 || a.data || null;
+    }
+    if (Array.isArray(data.assets) && data.assets.length > 0) {
+      const a = data.assets[0];
+      return a.base64 || a.b64 || a.data || null;
+    }
+    if (data.output && typeof data.output === 'object') {
+      return data.output.glb_b64 || data.output.b64_json || data.output.data || null;
+    }
+    return data.glb_b64 || data.b64_json || data.data || data.model_b64 || null;
+  };
+
+  const NVCF_ASSETS_ENDPOINT = 'https://api.nvcf.nvidia.com/v2/nvcf/assets';
+
+  // Helper: upload binary image to NVCF asset store (Node.js equivalent of
+  // the Workers helper in functions/api/trellis/submit.js).
+  async function uploadNvcfAsset({ imageBytes, mediaType, description }) {
+    const metaResp = await fetch(NVCF_ASSETS_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${NVIDIA_TRELLIS_KEY}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        contentType: mediaType,
+        description: description || 'VinCritiq vehicle image',
+      }),
+    });
+    if (!metaResp.ok) {
+      const body = await metaResp.text().catch(() => '');
+      throw new Error(`nvcf_asset_meta_${metaResp.status}: ${body.slice(0, 200)}`);
+    }
+    const meta = await metaResp.json();
+    if (!meta?.assetId || !meta?.uploadUrl) throw new Error('nvcf_asset_meta_missing_fields');
+    const putResp = await fetch(meta.uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': mediaType,
+        'x-amz-meta-nvcf-asset-description': description || 'VinCritiq vehicle image',
+      },
+      body: imageBytes,
+    });
+    if (!putResp.ok) {
+      const body = await putResp.text().catch(() => '');
+      throw new Error(`nvcf_asset_put_${putResp.status}: ${body.slice(0, 200)}`);
+    }
+    return meta.assetId;
+  }
+
+  app.post('/api/trellis/submit', async (req, res) => {
+    if (!NVIDIA_TRELLIS_KEY) {
+      return res.status(500).json({ error: 'NVIDIA_TRELLIS_API_KEY not configured (set it in .env)' });
+    }
+    const body = await readJsonBody(req);
+    if (!body) return res.status(400).json({ error: 'invalid_json' });
+    const { imageBase64, mediaType = 'image/png', seed = 0, noTexture = false } = body;
+    if (!imageBase64) return res.status(400).json({ error: 'imageBase64 is required' });
+    const clean = String(imageBase64).replace(/^data:[^,]+,/, '');
+
+    // TRELLIS requires images uploaded as NVCF assets — inline base64
+    // returns 422. Upload first, then reference the asset_id in the
+    // inference request (with the matching NVCF-INPUT-ASSET-REFERENCES
+    // header).
+    let assetId;
+    try {
+      const imageBytes = Buffer.from(clean, 'base64');
+      assetId = await uploadNvcfAsset({
+        imageBytes,
+        mediaType,
+        description: 'VinCritiq vehicle image for TRELLIS',
+      });
+    } catch (err) {
+      console.warn('[trellis←] asset upload failed', err.message);
+      return res.status(502).json({ error: 'nvcf_asset_upload_failed', message: String(err?.message || err) });
+    }
+
+    try {
+      const r = await fetch(TRELLIS_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${NVIDIA_TRELLIS_KEY}`,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'NVCF-INPUT-ASSET-REFERENCES': assetId,
+        },
+        body: JSON.stringify({
+          mode: 'image',
+          image: `data:${mediaType};asset_id,${assetId}`,
+          output_format: 'glb',
+          no_texture: noTexture,
+          samples: 1,
+          seed,
+        }),
+      });
+
+      if (r.status === 202) {
+        const requestId = r.headers.get('nvcf-reqid') || r.headers.get('NVCF-REQID');
+        if (!requestId) return res.status(502).json({ error: 'no_request_id' });
+        return res.json({ mode: 'async', requestId });
+      }
+      if (r.status === 200) {
+        const data = await r.json().catch(() => null);
+        const glbBase64 = extractGlbBase64(data);
+        if (!glbBase64) {
+          console.warn('[trellis←] 200 but no GLB found. Sample keys:', Object.keys(data || {}));
+          return res.status(502).json({ error: 'no_glb_in_response' });
+        }
+        return res.json({ mode: 'sync', glbBase64 });
+      }
+      const errBody = await r.text().catch(() => '');
+      console.warn('[trellis←] error', r.status, errBody.slice(0, 2000));
+      return res.status(r.status >= 500 ? 502 : r.status).json({ error: 'trellis_error', status: r.status, body: errBody.slice(0, 2000) });
+    } catch (err) {
+      console.warn('[trellis←] fetch threw', err);
+      return res.status(502).json({ error: 'nvidia_fetch_failed', message: String(err?.message || err) });
+    }
+  });
+
+  app.get('/api/trellis/status', async (req, res) => {
+    if (!NVIDIA_TRELLIS_KEY) {
+      return res.status(500).json({ error: 'NVIDIA_TRELLIS_API_KEY not configured' });
+    }
+    const requestId = String(req.query.requestId || '');
+    if (!requestId) return res.status(400).json({ error: 'requestId required' });
+    try {
+      const r = await fetch(`${NVCF_STATUS_BASE}/${encodeURIComponent(requestId)}`, {
+        headers: { Authorization: `Bearer ${NVIDIA_TRELLIS_KEY}`, Accept: 'application/json' },
+      });
+      if (r.status === 202) return res.json({ status: 'pending' });
+      if (r.status === 404) return res.json({ status: 'failed', reason: 'request_not_found' });
+      if (r.status >= 500) return res.json({ status: 'pending', _transient: true });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        return res.json({ status: 'failed', reason: `nvidia_${r.status}`, body: body.slice(0, 300) });
+      }
+      const data = await r.json().catch(() => null);
+      const glbBase64 = extractGlbBase64(data);
+      if (!glbBase64) return res.json({ status: 'failed', reason: 'no_glb_in_response' });
+      // Dev has no R2 — return the GLB inline as a data URL the client can
+      // render. No cross-session caching in dev (matches Tripo dev behavior).
+      const dataUrl = `data:model/gltf-binary;base64,${glbBase64}`;
+      return res.json({ status: 'ready', glbUrl: dataUrl, source: 'trellis', dev: true });
+    } catch (err) {
+      return res.json({ status: 'pending', _transient: true, error: String(err?.message || err) });
+    }
+  });
+
+  // Replicate (firtoz/trellis) — mirrors functions/api/replicate/*.js.
+  // In dev there's no R2 binding, so status returns the Replicate CDN URL
+  // directly. The browser loads from Replicate's signed URL which has
+  // permissive CORS, so this works without a proxy hop.
+  // firtoz/trellis is a community model — has to use the version-pinned
+  // /v1/predictions endpoint, not the official-models /v1/models/.../predictions.
+  // Override REPLICATE_TRELLIS_VERSION in .env to roll forward.
+  const REPLICATE_PREDICT = 'https://api.replicate.com/v1/predictions';
+  const DEFAULT_TRELLIS_VERSION = 'e8f6c45206993f297372f5436b90350817bd9b4a0d52d2a76df50c1c8afa2b3c';
+  const TRELLIS_VERSION = pickEnv('REPLICATE_TRELLIS_VERSION') || DEFAULT_TRELLIS_VERSION;
+
+  const findGlbUrl = (output) => {
+    if (!output) return null;
+    if (typeof output === 'string') return /\.glb(\?|$)/i.test(output) ? output : null;
+    if (Array.isArray(output)) return output.find((u) => typeof u === 'string' && /\.glb(\?|$)/i.test(u)) || null;
+    if (typeof output === 'object') {
+      const candidates = [output.model_file, output.glb, output.glb_url, output.mesh, output.output_glb];
+      for (const c of candidates) if (typeof c === 'string' && c) return c;
+      for (const v of Object.values(output)) if (typeof v === 'string' && /\.glb(\?|$)/i.test(v)) return v;
+    }
+    return null;
+  };
+
+  app.post('/api/replicate/predict', async (req, res) => {
+    if (!REPLICATE_API_TOKEN) {
+      return res.status(500).json({ error: 'REPLICATE_API_TOKEN not configured (set it in .env)' });
+    }
+    const body = await readJsonBody(req);
+    if (!body) return res.status(400).json({ error: 'invalid_json' });
+
+    const {
+      imageBase64,
+      mediaType = 'image/png',
+      imageUrl,
+      seed = 0,
+      textureSize = 1024,
+      meshSimplify = 0.95,
+      generateColor = true,
+      generateModel = true,
+      generateNormal = false,
+      ssSamplingSteps = 12,
+      slatSamplingSteps = 12,
+      ssGuidanceStrength = 7.5,
+      slatGuidanceStrength = 3.0,
+    } = body;
+
+    let image;
+    if (imageUrl && /^https?:\/\//.test(imageUrl)) {
+      image = imageUrl;
+    } else if (imageBase64) {
+      const clean = String(imageBase64).replace(/^data:[^,]+,/, '');
+      image = `data:${mediaType};base64,${clean}`;
+    } else {
+      return res.status(400).json({ error: 'imageUrl or imageBase64 required' });
+    }
+
+    try {
+      const r = await fetch(REPLICATE_PREDICT, {
+        method: 'POST',
+        headers: {
+          Authorization: `Token ${REPLICATE_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          version: TRELLIS_VERSION,
+          input: {
+            // firtoz/trellis expects an `images` array, not a single
+            // `image` field. Sending the singular form gets HTTP 422
+            // with "images is required".
+            images: [image],
+            seed,
+            texture_size: textureSize,
+            mesh_simplify: meshSimplify,
+            generate_color: generateColor,
+            generate_model: generateModel,
+            generate_normal: generateNormal,
+            randomize_seed: seed === 0,
+            ss_sampling_steps: ssSamplingSteps,
+            slat_sampling_steps: slatSamplingSteps,
+            ss_guidance_strength: ssGuidanceStrength,
+            slat_guidance_strength: slatGuidanceStrength,
+          },
+        }),
+      });
+      const data = await r.json().catch(() => null);
+      if (!r.ok || !data) {
+        console.warn('[replicate←] predict error', r.status, data && JSON.stringify(data).slice(0, 500));
+        return res.status(r.status >= 500 ? 502 : r.status).json({
+          error: 'replicate_error',
+          status: r.status,
+          body: data ? JSON.stringify(data).slice(0, 1500) : 'no_body',
+        });
+      }
+      if (!data.id) {
+        return res.status(502).json({ error: 'no_prediction_id', body: JSON.stringify(data).slice(0, 500) });
+      }
+      res.json({ predictionId: data.id, status: data.status, self: data.urls?.get || null });
+    } catch (err) {
+      console.warn('[replicate←] predict threw', err);
+      res.status(502).json({ error: 'replicate_fetch_failed', message: String(err?.message || err) });
+    }
+  });
+
+  app.get('/api/replicate/status', async (req, res) => {
+    if (!REPLICATE_API_TOKEN) {
+      return res.status(500).json({ error: 'REPLICATE_API_TOKEN not configured' });
+    }
+    const predictionId = String(req.query.predictionId || '');
+    if (!predictionId) return res.status(400).json({ error: 'predictionId required' });
+
+    try {
+      const r = await fetch(`https://api.replicate.com/v1/predictions/${encodeURIComponent(predictionId)}`, {
+        headers: { Authorization: `Token ${REPLICATE_API_TOKEN}`, Accept: 'application/json' },
+      });
+      if (r.status === 404) return res.json({ status: 'failed', reason: 'prediction_not_found' });
+      if (r.status >= 500) return res.json({ status: 'pending', _transient: true });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        return res.json({ status: 'failed', reason: `replicate_${r.status}`, body: body.slice(0, 300) });
+      }
+      const data = await r.json().catch(() => null);
+      if (!data) return res.json({ status: 'failed', reason: 'invalid_payload' });
+
+      if (data.status === 'starting' || data.status === 'processing') {
+        return res.json({ status: 'pending', replicateStatus: data.status });
+      }
+      if (data.status === 'failed' || data.status === 'canceled') {
+        return res.json({ status: 'failed', reason: data.error || `replicate_${data.status}` });
+      }
+      if (data.status !== 'succeeded') {
+        return res.json({ status: 'pending', replicateStatus: data.status });
+      }
+      const glbUrl = findGlbUrl(data.output);
+      if (!glbUrl) {
+        return res.json({
+          status: 'failed',
+          reason: 'no_glb_in_output',
+          outputSample: typeof data.output === 'string' ? data.output.slice(0, 200) : Object.keys(data.output || {}),
+        });
+      }
+      // Dev — no R2. Return the Replicate CDN URL directly; it has open
+      // CORS, so the browser can load it for the current session. No
+      // cross-session caching in dev (matches Tripo dev behavior).
+      return res.json({ status: 'ready', glbUrl, source: 'replicate-trellis', dev: true });
+    } catch (err) {
+      return res.json({ status: 'pending', _transient: true, error: String(err?.message || err) });
+    }
+  });
+
   // VinAudit Vehicle Images — mirrors functions/api/vinaudit-images.js.
   // Returns base64-encoded images that the Tripo pipeline can feed directly
   // (no separate URL fetch round-trip). Same env-var fallback as the
@@ -373,13 +686,28 @@ module.exports = function (app) {
       pose: String(req.query.pose || 'front_right'),
       size: String(req.query.size || 'medium'),
       color: String(req.query.color || 'white'),
-      granularity: 'trim',
+      // 'model' granularity lets all trims of a given year/make/model
+      // share a single image (S5 Premium = S5 Premium Plus = S5 Prestige
+      // visually) — saves per-call VinAudit cost.
+      granularity: String(req.query.granularity || 'model'),
     });
     try {
       const r = await fetch(`https://images.vinaudit.com/v3/images?${params.toString()}`);
       const data = await r.json().catch(() => ({}));
       if (!r.ok || data?.success === false) {
-        console.warn('[vinaudit-images←]', r.status, data?.error);
+        // VinAudit returns 400 for any VIN that isn't in their supported
+        // YMMT spreadsheet (newer model years often aren't). That's
+        // expected data-gap behavior, not an error worth screaming about
+        // — downgrade to log so it doesn't fill the terminal with warnings.
+        const isUnsupportedVinError =
+          r.status === 400 &&
+          Array.isArray(data?.error) &&
+          data.error.some((m) => typeof m === 'string' && m.toLowerCase().includes('not supported'));
+        if (isUnsupportedVinError) {
+          console.log('[vinaudit-images←] VIN not in supported YMMT list (expected for new model years)');
+        } else {
+          console.warn('[vinaudit-images←]', r.status, data?.error);
+        }
         return res.status(r.status >= 400 ? r.status : 502).json({
           error: data?.error || `VinAudit ${r.status}`,
         });

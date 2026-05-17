@@ -1,0 +1,77 @@
+import React from 'react';
+import { ShoppingCart, Tag, Search } from 'lucide-react';
+import { useChat } from '../contexts/ChatContext';
+
+// Top-of-chat segmented control that switches the analysis mode:
+//
+//   Buy a Car   — current default; evaluates a listing as a buy decision
+//   Sell a Car  — analyzes the user's vehicle and recommends best sale channel
+//   Find Me a Car — placeholder for future personalized recommendation flow
+//
+// Switching tabs doesn't load a session; it just changes the active mode.
+// The sidebar then filters its session list to sessions tagged with the new
+// mode, and any new chat the user starts gets tagged with the new mode.
+//
+// Labels chosen for clarity over cleverness — the user's brief said titles
+// can be tweaked for UX, and "Buy a Car / Sell a Car / Find Me a Car" reads
+// the same way a friend would offer to help.
+const TABS = [
+  { id: 'buy',  label: 'Buy a Car',     icon: ShoppingCart, description: 'Analyze a listing — is it a good deal?' },
+  { id: 'sell', label: 'Sell a Car',    icon: Tag,          description: "Find the best price to sell your vehicle" },
+  { id: 'find', label: 'Find Me a Car', icon: Search,       description: 'Coming soon — personalized recommendations', disabled: true },
+];
+
+export default function ModeTabs() {
+  const { activeMode, setActiveMode, startNewChat } = useChat();
+
+  const handleClick = (mode) => {
+    if (mode === activeMode) return;
+    setActiveMode(mode);
+    // Switching modes lands the user on an empty new-chat state for that
+    // tab. The sidebar still shows sessions of the new mode so they can
+    // click into one if they want; otherwise they start fresh.
+    if (typeof startNewChat === 'function') startNewChat();
+  };
+
+  return (
+    <div
+      className="flex items-center gap-1 p-1 rounded-xl mx-auto"
+      style={{
+        background: 'var(--color-surface)',
+        border: '1px solid var(--color-border)',
+        maxWidth: 480,
+      }}
+      role="tablist"
+      aria-label="Analysis mode"
+    >
+      {TABS.map((tab) => {
+        const Icon = tab.icon;
+        const active = activeMode === tab.id;
+        return (
+          <button
+            key={tab.id}
+            onClick={() => !tab.disabled && handleClick(tab.id)}
+            disabled={tab.disabled}
+            role="tab"
+            aria-selected={active}
+            title={tab.description}
+            className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-all disabled:cursor-not-allowed"
+            style={{
+              background: active ? 'var(--color-accent)' : 'transparent',
+              color: active
+                ? '#fff'
+                : tab.disabled
+                ? 'var(--color-muted)'
+                : 'var(--color-text)',
+              opacity: tab.disabled ? 0.5 : 1,
+              fontWeight: active ? 600 : 500,
+            }}
+          >
+            <Icon size={14} />
+            <span className="whitespace-nowrap">{tab.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
