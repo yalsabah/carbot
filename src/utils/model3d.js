@@ -72,6 +72,14 @@ export function isTripoCdnUrl(url) {
   return typeof url === 'string' && TRIPO_CDN_RE.test(url);
 }
 
+// Replicate signs its CDN URLs for ~1 hour. Like Tripo URLs they can't be
+// trusted as a long-lived cache entry — they 404 once the signature
+// expires.
+const REPLICATE_CDN_RE = /https?:\/\/[^/]*replicate\.delivery\//i;
+export function isReplicateCdnUrl(url) {
+  return typeof url === 'string' && REPLICATE_CDN_RE.test(url);
+}
+
 // ─── Slug builder ─────────────────────────────────────────────────────────────
 // Two cars sharing year/make/model/trim share a slug. Trim is optional — many
 // VINs decode without one, in which case we drop it from the slug.
@@ -418,11 +426,11 @@ async function runReplicatePipeline({
       await markReady(slug, result.glbUrl, vin || null, { source: 'r2', modelProvider: 'replicate-trellis' });
       dlog('Replicate: markReady with R2 URL', { url: result.glbUrl.slice(0, 80) });
     } else if (process.env.NODE_ENV !== 'production') {
-      // Dev — persist the Replicate URL with a 22h expiry. Replicate's
-      // CDN URLs are signed but typically valid for at least a day, so
-      // same-day reopens will cache-hit. After expiry, the slug
-      // re-claims and regenerates.
-      const expiresAt = Date.now() + 22 * 60 * 60 * 1000;
+      // Dev — persist the Replicate URL with a SHORT expiry. Replicate
+      // signs its CDN URLs for ~1 hour; we use 50 min to keep a safety
+      // buffer against clock skew. After expiry, the slug re-claims and
+      // regenerates — better than caching a URL that will 404 mid-render.
+      const expiresAt = Date.now() + 50 * 60 * 1000;
       await markReady(slug, result.glbUrl, vin || null, { source: 'replicate', expiresAt, modelProvider: 'replicate-trellis' });
       dlog('Dev: markReady with Replicate URL + expiresAt');
     } else {
@@ -629,9 +637,13 @@ export async function wait3DModel(taskId, onProgress, signal) {
 //     until that timestamp passes. After expiry the doc gets re-claimed.
 function isUsableCachedDoc(data) {
   if (!data || data.status !== 'ready' || !data.glbUrl) return false;
-  if (!isTripoCdnUrl(data.glbUrl)) return true;   // R2 / other — always fine
-  // From here on it IS a Tripo URL
+  // R2 (or any non-signed-CDN) URL — long-lived, always fine.
+  if (!isTripoCdnUrl(data.glbUrl) && !isReplicateCdnUrl(data.glbUrl)) return true;
+  // From here on it IS a signed CDN URL (Tripo or Replicate). Prod should
+  // never cache these — production goes through R2.
   if (process.env.NODE_ENV === 'production') return false;
+  // Dev: trust until the recorded expiry passes. Tripo writes 22h, Replicate
+  // writes ~50min; either way the read-side just checks the stored value.
   const expiresAt = typeof data.glbUrlExpiresAt === 'number' ? data.glbUrlExpiresAt : 0;
   return Date.now() < expiresAt;
 }
@@ -794,28 +806,46 @@ async function persistGlbToR2(slug, sourceUrl) {
 }
 
 async function markReady(slug, glbUrl, sourceVin, opts = {}) {
+  const patch = {
+    status: 'ready',
+    glbUrl,
+    generatedAt: serverTimestamp(),
+    sourceVin: sourceVin || null,
+    glbUrlSource: opts.source || (isTripoCdnUrl(glbUrl) ? 'tripo' : 'r2'),
+  };
+  // modelProvider tracks the GENERATOR (tripo / replicate-trellis / nvidia-trellis),
+  // separate from glbUrlSource which tracks the HOST (r2 / tripo CDN / replicate CDN).
+  // Needed so the modal can show the user which provider built the model.
+  if (opts.modelProvider) {
+    patch.modelProvider = opts.modelProvider;
+  }
+  // expiresAt is only set for Tripo URLs in dev; R2 URLs never expire so
+  // we explicitly omit the field rather than carrying a stale one over.
+  if (typeof opts.expiresAt === 'number') {
+    patch.glbUrlExpiresAt = opts.expiresAt;
+  }
   try {
-    const patch = {
-      status: 'ready',
-      glbUrl,
-      generatedAt: serverTimestamp(),
-      sourceVin: sourceVin || null,
-      glbUrlSource: opts.source || (isTripoCdnUrl(glbUrl) ? 'tripo' : 'r2'),
-    };
-    // modelProvider tracks the GENERATOR (tripo / replicate-trellis / nvidia-trellis),
-    // separate from glbUrlSource which tracks the HOST (r2 / tripo CDN / replicate CDN).
-    // Needed so the modal can show the user which provider built the model.
-    if (opts.modelProvider) {
-      patch.modelProvider = opts.modelProvider;
-    }
-    // expiresAt is only set for Tripo URLs in dev; R2 URLs never expire so
-    // we explicitly omit the field rather than carrying a stale one over.
-    if (typeof opts.expiresAt === 'number') {
-      patch.glbUrlExpiresAt = opts.expiresAt;
-    }
     await updateDoc(doc(db, 'models3d', slug), patch);
+    dlog('markReady ok', { slug, fields: Object.keys(patch) });
   } catch (err) {
-    console.warn('models3d markReady failed', err);
+    // Loud + actionable. The most common cause is a Firestore-rules
+    // mismatch — every new field added to the patch above must also be
+    // whitelisted in the models3d security rule's hasOnly([...]). A
+    // silent failure here leaves the slug doc stuck at status='pending',
+    // so every future analysis of the same vehicle re-generates the 3D
+    // model (paying the provider cost every time). Surface this fact
+    // explicitly so the cause is obvious.
+    const isPermission =
+      err?.code === 'permission-denied' ||
+      /insufficient permissions|permission/i.test(err?.message || '');
+    // eslint-disable-next-line no-console
+    console.error(
+      isPermission
+        ? '%c[models3d] markReady WRITE BLOCKED by Firestore rules — slug doc stays "pending" and every future view will re-generate this 3D model. Add the missing field(s) to the models3d rule\'s hasOnly([...]) whitelist.'
+        : '%c[models3d] markReady failed — slug doc stays "pending" and every future view will re-generate this 3D model.',
+      'color:#dc2626;font-weight:bold',
+      { slug, patchFields: Object.keys(patch), err },
+    );
   }
 }
 

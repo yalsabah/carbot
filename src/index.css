@@ -111,6 +111,17 @@ body {
 .modal-backdrop-exit { animation: modal-backdrop-out 0.18s ease-in both; }
 .modal-content-enter { animation: modal-content-in 0.25s cubic-bezier(0.22,1,0.36,1) both; }
 
+/* Side-by-side report modal — slides in from the right, no backdrop, leaves
+   the chat on the left visible and interactive. */
+@keyframes modal-side-in { from { transform: translateX(100%); } to { transform: translateX(0); } }
+@keyframes modal-side-out { from { transform: translateX(0); } to { transform: translateX(100%); } }
+.modal-side-enter { animation: modal-side-in 0.28s cubic-bezier(0.22,1,0.36,1) both; }
+.modal-side-exit  { animation: modal-side-out 0.22s cubic-bezier(0.55,0.06,0.68,0.19) both; }
+
+/* Chat container gives up space to a side-by-side modal. Animated so the
+   transition feels continuous with the modal's slide. */
+.chat-with-side-modal { transition: padding-right 0.28s cubic-bezier(0.22,1,0.36,1); }
+
 /* 3D model loading pulse */
 @keyframes model-pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 0.8; } }
 .model-loading { animation: model-pulse 1.8s ease-in-out infinite; }
