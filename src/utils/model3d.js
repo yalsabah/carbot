@@ -197,7 +197,18 @@ async function fetchVinAuditPhoto(vin, vehicle = null) {
 // its `image` field is hardcoded to 4 example_id values and rejects
 // user uploads with HTTP 422 ("Expected: example_id, got: asset_id").
 // The scaffolding is kept behind the 'trellis' flag but never default.
-const MODEL_PROVIDER = (process.env.REACT_APP_MODEL_PROVIDER || 'replicate').toLowerCase();
+const DEFAULT_MODEL_PROVIDER = (process.env.REACT_APP_MODEL_PROVIDER || 'replicate').toLowerCase();
+
+// Resolve the provider for a single generateOrFetch3D call. The caller
+// can pass `providerOverride` from user preferences (stored in Firestore
+// per account). 'auto' or any falsy value falls back to the build-time
+// default, preserving central control while still letting individual
+// users force a specific engine.
+function resolveProvider(providerOverride) {
+  const raw = String(providerOverride || '').toLowerCase();
+  if (raw === 'tripo' || raw === 'replicate' || raw === 'trellis') return raw;
+  return DEFAULT_MODEL_PROVIDER;
+}
 
 // ─── TRELLIS submit + wait ───────────────────────────────────────────────────
 // Same shape as Tripo's submit/wait so generateOrFetch3D can use either
@@ -993,13 +1004,17 @@ export async function generateOrFetch3D({
   onProgress,
   onCost,    // optional ({ label, amount, detail }) — fires once per paid event
   signal,
+  providerOverride,  // 'auto' | 'tripo' | 'replicate' | 'trellis' from user prefs
 } = {}) {
   const slug = buildModelSlug(vehicle);
+  const effectiveProvider = resolveProvider(providerOverride);
   dlog('generateOrFetch3D start', {
     slug,
     hasUserPhoto: !!imageBase64,
     vin: vin || null,
     vehicle: vehicle ? { year: vehicle.year, make: vehicle.make, model: vehicle.model, trim: vehicle.trim } : null,
+    provider: effectiveProvider,
+    providerOverride: providerOverride || null,
   });
 
   // 1. Cache lookup + claim (only if we have a slug)
@@ -1072,7 +1087,7 @@ export async function generateOrFetch3D({
   //     Both 'replicate' and 'trellis' have their /status endpoint relay
   //     the GLB into R2 server-side, so there's no separate persist step
   //     on those paths — they return a final URL directly.
-  if (MODEL_PROVIDER === 'replicate') {
+  if (effectiveProvider === 'replicate') {
     const replicateResult = await runReplicatePipeline({
       slug,
       claim,
@@ -1086,7 +1101,7 @@ export async function generateOrFetch3D({
     if (replicateResult) return replicateResult;
     dwarn('Replicate returned no GLB — falling back to Tripo3D for this run');
     // fall through to Tripo flow below
-  } else if (MODEL_PROVIDER === 'trellis') {
+  } else if (effectiveProvider === 'trellis') {
     const trellisResult = await runTrellisPipeline({
       slug,
       claim,

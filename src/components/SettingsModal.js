@@ -51,6 +51,27 @@ export default function SettingsModal({ onClose }) {
   const [billingBusy, setBillingBusy] = useState(false);
   const [billingError, setBillingError] = useState(null);
 
+  // ── 3D model preference ───────────────────────────────────────────
+  // Stored at `users/{uid}.preferences.modelProvider`. 'auto' lets the
+  // server-side default (REACT_APP_MODEL_PROVIDER) decide; 'tripo' /
+  // 'replicate' force that provider for every analysis on this account.
+  // Reads default to 'auto' so existing users without the field set
+  // continue to get the same behavior they had before.
+  const currentModelProvider = userDoc?.preferences?.modelProvider || 'auto';
+  const [modelProviderBusy, setModelProviderBusy] = useState(false);
+  const saveModelProvider = async (value) => {
+    if (!user || value === currentModelProvider || modelProviderBusy) return;
+    setModelProviderBusy(true);
+    try {
+      await updateDoc(doc(db, 'users', user.uid), {
+        'preferences.modelProvider': value,
+      });
+      await refreshUserDoc();
+    } finally {
+      setModelProviderBusy(false);
+    }
+  };
+
   const emailChanged =
     email.trim().length > 0 &&
     email.trim().toLowerCase() !== (user?.email || '').toLowerCase();
@@ -433,6 +454,62 @@ export default function SettingsModal({ onClose }) {
                     We'll send a verification link to the new address. Your email
                     only changes after you click that link.
                   </p>
+                </div>
+
+                {/* 3D Model preference — which generator runs for new
+                    analyses on this account. Saved to Firestore so the
+                    choice persists across devices. */}
+                <div
+                  className="pt-5 mt-5"
+                  style={{ borderTop: '1px solid var(--color-border)' }}
+                >
+                  <h4
+                    className="text-xs font-semibold uppercase tracking-wider mb-1"
+                    style={{ color: 'var(--color-muted)' }}
+                  >
+                    3D Model Provider
+                  </h4>
+                  <p className="text-xs mb-3" style={{ color: 'var(--color-muted)', opacity: 0.8 }}>
+                    Choose which engine renders the 3D model for each
+                    analysis. Auto follows the app default; Replicate is
+                    cheaper and faster; Tripo3D is slower but generally
+                    higher-fidelity.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    {[
+                      { id: 'auto',      label: 'Auto',              detail: 'App default',      sub: 'Recommended' },
+                      { id: 'replicate', label: 'Replicate · TRELLIS', detail: '~30–60s · $0.04', sub: 'Fast, cheap' },
+                      { id: 'tripo',     label: 'Tripo3D',            detail: '~2–5min · $0.30', sub: 'Slower, higher detail' },
+                    ].map((opt) => {
+                      const active = currentModelProvider === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          onClick={() => saveModelProvider(opt.id)}
+                          disabled={modelProviderBusy || active}
+                          className="text-left rounded-lg p-3 transition-all"
+                          style={{
+                            background: active ? 'var(--color-accent)' : 'var(--color-bg)',
+                            border: active ? '1px solid var(--color-accent)' : '1px solid var(--color-border)',
+                            color: active ? '#fff' : 'var(--color-text)',
+                            cursor: active ? 'default' : 'pointer',
+                            opacity: modelProviderBusy && !active ? 0.5 : 1,
+                          }}
+                        >
+                          <div className="text-sm font-semibold mb-0.5 flex items-center gap-1.5">
+                            {active && <Check size={12} />}
+                            {opt.label}
+                          </div>
+                          <div className="text-[10px]" style={{ opacity: active ? 0.9 : 0.7 }}>
+                            {opt.detail}
+                          </div>
+                          <div className="text-[10px] mt-0.5" style={{ opacity: active ? 0.75 : 0.55 }}>
+                            {opt.sub}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
                 {/* Sign Out — danger zone, separated visually */}

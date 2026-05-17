@@ -5,6 +5,7 @@ import { OrbitControls, useGLTF, Environment } from '@react-three/drei';
 import * as THREE from 'three';
 import VehicleCanvas from './VehicleCanvas';
 import { fetchVinAuditImages } from '../utils/vinAuditImages';
+import ModelFeedbackButton from './ModelFeedbackButton';
 
 // Local error boundary so a GLB load failure doesn't kill the report
 // modal (or worse, the whole app). When the GLTFLoader throws — usually
@@ -321,6 +322,33 @@ function GLBScene({ url, swatch }) {
       <Environment preset="city" />
     </>
   );
+}
+
+// Small probe inside <Canvas> that hands a screenshot-capture function
+// back up to the parent via a ref. Lives inside the Three fiber tree so
+// it can read the renderer (gl) — the parent ModelFeedbackButton can
+// then take a JPEG of the current viewport at submit time.
+//
+// Requires the parent <Canvas> to be created with preserveDrawingBuffer
+// set (otherwise gl.domElement.toDataURL returns an empty image).
+function CanvasCaptureProbe({ captureRef }) {
+  const { gl } = useThree();
+  useEffect(() => {
+    if (!captureRef) return undefined;
+    captureRef.current = () => {
+      try {
+        // Force one render-into-the-back-buffer so the captured frame is
+        // up-to-date (autoRotate means the buffer is in flux). Then read.
+        return gl.domElement.toDataURL('image/jpeg', 0.82);
+      } catch {
+        return null;
+      }
+    };
+    return () => {
+      if (captureRef.current) captureRef.current = null;
+    };
+  }, [gl, captureRef]);
+  return null;
 }
 
 function ColorSwatchRow({ activeId, onSelect }) {
@@ -830,7 +858,7 @@ function formatProviderLabel(modelProvider) {
   }
 }
 
-function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect, activeTab, userImages, onAddImage }) {
+function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, activeColorId, onColorSelect, activeTab, userImages, onAddImage, captureRef }) {
   const bodyStyle = inferBodyStyle(vehicle);
   const activeSwatch = BODY_COLORS.find(c => c.id === activeColorId) || null;
   const fileInputRef = useRef(null);
@@ -940,8 +968,16 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
             />
           }
         >
-          <Canvas camera={{ fov: 38 }} style={{ background: 'transparent' }}>
+          <Canvas
+            camera={{ fov: 38 }}
+            style={{ background: 'transparent' }}
+            // preserveDrawingBuffer keeps the rendered frame readable so
+            // the feedback button can grab a screenshot via toDataURL.
+            // Slight perf hit; negligible for a single-model viewer.
+            gl={{ preserveDrawingBuffer: true }}
+          >
             <GLBScene url={glbUrl} swatch={activeSwatch} />
+            <CanvasCaptureProbe captureRef={captureRef} />
           </Canvas>
         </ModelErrorBoundary>
       ) : showAddImageCTA ? (
@@ -1074,7 +1110,7 @@ function LeftPanel({ vehicleColor, glbUrl, modelStatus, vehicle, wheelColor, act
   );
 }
 
-export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, modelProvider, userImages = [], onAddImage, onClose, onConfirmEdits, isReanalyzing, layout = 'sideBySide', onChangeLayout, widthPct = 65, onChangeWidthPct, onResizingChange }) {
+export default function ReportModal({ report, vehicleColor, vehicleLabel, imageBase64, imageMediaType, glbUrl, modelStatus, modelProvider, userImages = [], onAddImage, onClose, onConfirmEdits, isReanalyzing, layout = 'sideBySide', onChangeLayout, widthPct = 65, onChangeWidthPct, onResizingChange, sessionId = null, messageId = null }) {
   // Two presentations:
   //   'sideBySide' — anchored to the right (width = widthPct vw), no backdrop.
   //                  Chat on the left stays interactive so the user can answer
@@ -1117,6 +1153,10 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
   };
   const [exiting, setExiting] = useState(false);
   const closeTimer = useRef(null);
+  // Set by CanvasCaptureProbe inside <Canvas> — returns a JPEG data URL
+  // of the current 3D viewport when called. Consumed by ModelFeedbackButton
+  // at submit time so a "report bad render" attaches what the user saw.
+  const captureRef = useRef(null);
   // Color picker state. Seeded from the CARFAX/decoded color when possible so
   // the GLB opens with a tint that matches the actual car; user can override.
   const inferredColorId = inferColorIdFromVehicle(report?.vehicle);
@@ -1228,6 +1268,7 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
             activeTab={activeTab}
             userImages={userImages}
             onAddImage={onAddImage}
+            captureRef={captureRef}
           />
 
           {/* Bottom gradient + info — theme-aware fade so text stays legible */}
@@ -1242,7 +1283,23 @@ export default function ReportModal({ report, vehicleColor, vehicleLabel, imageB
             {vehicle?.mileage && <div className="text-sm mt-1" style={{ color: 'var(--color-muted)', opacity: 0.8 }}>{vehicle.mileage.toLocaleString()} miles</div>}
             <div className="mt-3">{verdict?.rating && <VerdictBadge rating={verdict.rating} large />}</div>
             <div className="flex items-end justify-between gap-2 mt-2">
-              <p className="text-xs" style={{ color: 'var(--color-muted)', opacity: 0.7 }}>Drag to rotate · auto-spins</p>
+              <div className="flex items-center gap-2 min-w-0">
+                <p className="text-xs" style={{ color: 'var(--color-muted)', opacity: 0.7 }}>Drag to rotate · auto-spins</p>
+                {/* "Report an issue" — only meaningful when we're showing
+                    a real generated GLB. Hidden for the procedural
+                    fallback (nothing to report on a placeholder). */}
+                {glbUrl && activeTab === 'model' && (
+                  <ModelFeedbackButton
+                    vehicle={vehicle}
+                    modelProvider={modelProvider}
+                    glbUrl={glbUrl}
+                    userImages={userImages}
+                    sessionId={sessionId}
+                    messageId={messageId}
+                    captureScreenshot={() => (captureRef.current ? captureRef.current() : null)}
+                  />
+                )}
+              </div>
               {/* Subtle provider attribution — only shown on 3D Model tab
                   with a real GLB loaded. Helps tell Tripo3D vs Replicate
                   TRELLIS output apart at a glance. */}
