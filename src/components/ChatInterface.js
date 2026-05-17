@@ -739,6 +739,15 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 		activeReportRef.current = activeReport;
 	}, [activeReport]);
 
+	// User's 3D-model-provider preference, mirrored to a ref so
+	// startRodinJob can read the latest value at call time without
+	// becoming dependent on userDoc (which churns on every settings
+	// save and would otherwise recreate the callback unnecessarily).
+	const modelProviderPrefRef = useRef('auto');
+	useEffect(() => {
+		modelProviderPrefRef.current = userDoc?.preferences?.modelProvider || 'auto';
+	}, [userDoc?.preferences?.modelProvider]);
+
 	// Notify the parent (App.js) whenever the report modal opens or closes
 	// so it can auto-collapse the left sidebar — giving the chat ↔ report
 	// split the full screen. App.js restores the user's prior sidebar state
@@ -1128,6 +1137,10 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					imageBase64,
 					imageMediaType,
 					vin: vehicle?.vin ?? null,
+					// Honors the user's Settings → 3D Model Provider choice.
+					// 'auto' falls back to REACT_APP_MODEL_PROVIDER inside
+					// generateOrFetch3D's resolveProvider helper.
+					providerOverride: modelProviderPrefRef.current,
 					onProgress: ({ status }) => {
 						if (controller.signal.aborted) return;
 						setActiveReport((prev) =>
@@ -2584,6 +2597,8 @@ export default function ChatInterface({ onShowUpgrade, onShowAuth, compactTrigge
 					glbUrl={activeReport.glbUrl}
 					modelStatus={activeReport.modelStatus}
 					modelProvider={activeReport.modelProvider || null}
+					sessionId={activeReport.sessionId || null}
+					messageId={activeReport.messageId || null}
 					layout={reportLayout}
 					onChangeLayout={setReportLayout}
 					widthPct={reportWidthPct}
